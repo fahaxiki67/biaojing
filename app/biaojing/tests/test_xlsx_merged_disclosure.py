@@ -57,6 +57,7 @@ class XlsxMergedDisclosureTests(unittest.TestCase):
         self.assertIn("左上角", item["quote"])
         self.assertIn("人工", item["quote"])
         self.assertEqual(rec["counts"]["merged_ranges_total"], 1)
+        self.assertEqual(rec["counts"]["merged_ranges_incomplete"], False)
         self.assertEqual(rec["status"], "success")
 
     def test_no_merge_no_disclosure(self):
@@ -82,16 +83,59 @@ class XlsxMergedDisclosureTests(unittest.TestCase):
                          without["counts"]["cells_total"])
 
     def test_merge_cap_is_disclosed_not_silent(self):
-        # 畸形超量合并区域：触顶必须留痕（note），不得静默截断
+        # 畸形超量合并区域：触顶必须留痕（note），并如实降为 partial
         merges = [f"C{r}:D{r}" for r in range(3, 3 + 1001)]
         data = _wb_with_merges(merges)
         rec = xlsx_parser.parse(data)
         merged = [e for e in rec["evidence"]
                   if e["kind"] == "xlsx_merged_range"]
-        self.assertLessEqual(len(merged), 1000)
-        self.assertTrue(any("合并区域" in n and ("上限" in n or "截断" in n)
-                            for n in rec["notes"]),
+        self.assertEqual(len(merged), 1000)
+        self.assertTrue(any("上限" in n for n in rec["notes"]),
                         f"触顶未留痕：{rec['notes']}")
+        self.assertEqual(rec["counts"]["merged_ranges_incomplete"], True)
+        self.assertEqual(rec["status"], "partial")
+
+    def test_multi_sheet_aggregate_cap(self):
+        # 全局每工作簿上限：两表各 600 条（合计 1200 > 1000），
+        # 第二表只收到 400 条即止，触顶如实降为 partial
+        wb = openpyxl.Workbook()
+        ws1 = wb.active
+        ws1.title = "一表"
+        ws2 = wb.create_sheet("二表")
+        for r in range(3, 603):
+            ws1.merge_cells(f"A{r}:B{r}")
+            ws2.merge_cells(f"A{r}:B{r}")
+        buf = io.BytesIO()
+        wb.save(buf)
+        rec = xlsx_parser.parse(buf.getvalue())
+        merged = [e for e in rec["evidence"]
+                  if e["kind"] == "xlsx_merged_range"]
+        self.assertEqual(len(merged), 1000)
+        per_sheet = {e["sheet"] for e in merged}
+        self.assertEqual(per_sheet, {"一表", "二表"})
+        self.assertTrue(any("上限" in n for n in rec["notes"]))
+        self.assertEqual(rec["counts"]["merged_ranges_incomplete"], True)
+        self.assertEqual(rec["status"], "partial")
+
+    def test_unreadable_merge_part_is_reported_not_silent(self):
+        # 工作表部件损坏：辅助层不得崩溃，必须置 incomplete 并留痕
+        import zipfile as _zipfile
+        good = _wb_with_merges(["A2:A3"])
+        src = {}
+        with _zipfile.ZipFile(io.BytesIO(good)) as z:
+            for name in z.namelist():
+                src[name] = z.read(name)
+        src["xl/worksheets/sheet1.xml"] = b"<worksheet><mergeCells><mergeCell"
+        buf = io.BytesIO()
+        with _zipfile.ZipFile(buf, "w") as z:
+            for name, payload in src.items():
+                z.writestr(name, payload)
+        merges, notes, incomplete = xlsx_parser._merged_ranges_by_sheet(
+            buf.getvalue())
+        self.assertFalse(merges)
+        self.assertTrue(incomplete)
+        self.assertTrue(any("不完整" in n for n in notes),
+                        f"损坏部件未留痕：{notes}")
 
 
 if __name__ == "__main__":

@@ -49,8 +49,10 @@ EXTRACTION_VERSION = (
     f"merged-range disclosure; v2"
 )
 
-# 合并区域披露上限（防畸形文件）：触顶留痕，不做静默截断
+# 合并区域披露上限（全局每工作簿）：触顶留痕并降为 partial，不做静默截断；
+# 单表部件超过字节上限不流式读取（防敌意超大部件撑内存），留痕并降为 partial
 _MAX_MERGED_RANGES = 1000
+_MAX_MERGE_SHEET_XML_BYTES = 64 * 1024 * 1024
 
 
 class _HeldBytesIO(io.BytesIO):
@@ -119,18 +121,23 @@ def _comments_by_sheet(data: bytes) -> tuple[dict, list[str]]:
     return comments, notes
 
 
-def _merged_ranges_by_sheet(data: bytes) -> tuple[dict, list[str]]:
-    """只读解压 OOXML，从各工作表部件收集 mergeCells 合并区域。
+def _merged_ranges_by_sheet(data: bytes) -> tuple[dict, list[str], bool]:
+    """只读解压 OOXML，从各工作表部件有界流式收集 mergeCells 合并区域。
 
     read_only 模式下 openpyxl 不暴露 merged_cells（恒为 None），这里直接
-    读工作表 XML 的 <mergeCell ref="A2:A4"/>；合并区域到候选行/列的填充
-    属于候选层，本层只负责把结构如实暴露，触顶留痕不做静默截断。
+    读工作表 XML 的 <mergeCell ref="A2:A4"/>。内存边界：iterparse 逐元素
+    读取、读毕 ref 立即 clear，绝不整份物化工作表 XML；单表部件超字节
+    上限不读取；全局每工作簿收集超条数上限即停。任何截断/不可读都置
+    incomplete=True，由调用方降为 partial 并留痕，绝不静默。
     """
     ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
     rel_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
     pkg_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+    merge_tag = f"{{{ns}}}mergeCell"
     merges: dict[str, list[str]] = {}
     notes: list[str] = []
+    incomplete = False
+    total = 0
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as package:
             workbook = ET.fromstring(package.read("xl/workbook.xml"))
@@ -147,30 +154,55 @@ def _merged_ranges_by_sheet(data: bytes) -> tuple[dict, list[str]]:
                               if target.startswith("/") else
                               posixpath.normpath(posixpath.join("xl", target)))
                 try:
-                    root = ET.fromstring(package.read(sheet_path))
-                except (OSError, KeyError, ET.ParseError):
+                    info = package.getinfo(sheet_path)
+                except KeyError:
                     continue
-                refs = [m.attrib.get("ref", "")
-                        for m in root.findall(f".//{{{ns}}}mergeCell")]
-                refs = [ref for ref in refs if ref]
-                if len(refs) > _MAX_MERGED_RANGES:
+                if info.file_size > _MAX_MERGE_SHEET_XML_BYTES:
+                    incomplete = True
                     notes.append(
-                        f"工作表 [{sheet_name}] 合并区域超过 "
-                        f"{_MAX_MERGED_RANGES} 条，超出部分未读取"
-                        "（触顶留痕，不做静默截断）")
-                    refs = refs[:_MAX_MERGED_RANGES]
-                if refs:
-                    merges[sheet_name] = refs
+                        f"工作表 [{sheet_name}] 部件 {info.file_size} 字节，"
+                        f"超过合并区域扫描上限 {_MAX_MERGE_SHEET_XML_BYTES}"
+                        " 字节，未读取（触顶留痕，降为 partial）")
+                    continue
+                collected: list[str] = []
+                hit_cap = False
+                try:
+                    with package.open(sheet_path) as stream:
+                        for _event, elem in ET.iterparse(stream,
+                                                         events=("end",)):
+                            if elem.tag == merge_tag:
+                                ref = elem.attrib.get("ref", "")
+                                if ref:
+                                    if total >= _MAX_MERGED_RANGES:
+                                        hit_cap = True
+                                        break
+                                    collected.append(ref)
+                                    total += 1
+                            elem.clear()
+                except (OSError, ET.ParseError) as exc:
+                    incomplete = True
+                    notes.append(
+                        f"工作表 [{sheet_name}] 合并区域读取不完整："
+                        f"{type(exc).__name__}: {exc}")
+                if hit_cap:
+                    incomplete = True
+                    notes.append(
+                        f"工作表 [{sheet_name}] 合并区域达到全局上限 "
+                        f"{_MAX_MERGED_RANGES} 条，超出部分未披露"
+                        "（触顶留痕，降为 partial）")
+                if collected:
+                    merges[sheet_name] = collected
     except (OSError, KeyError, ValueError, ET.ParseError, zipfile.BadZipFile) as exc:
+        incomplete = True
         notes.append(f"Excel 合并区域读取不完整：{type(exc).__name__}: {exc}")
-    return merges, notes
+    return merges, notes, incomplete
 
 
 def parse(data: bytes, max_cells: int = 20_000,
           max_scan_rows: int = DEFAULT_MAX_SCAN_ROWS,
           max_scan_cells: int = DEFAULT_MAX_SCAN_CELLS) -> dict:
     comments, comment_notes = _comments_by_sheet(data)
-    merges, merge_notes = _merged_ranges_by_sheet(data)
+    merges, merge_notes, merges_incomplete = _merged_ranges_by_sheet(data)
     notes = list(comment_notes) + merge_notes
     evidence_truncated = False
     scan_truncated = False
@@ -323,9 +355,11 @@ def parse(data: bytes, max_cells: int = 20_000,
             "formulas_total": formulas_total,
             "formulas_cached_unknown": cached_unknown,
             "merged_ranges_total": sum(len(v) for v in merges.values()),
+            "merged_ranges_incomplete": merges_incomplete,
         }
 
-        if scan_truncated or evidence_truncated or comments_incomplete:
+        if (scan_truncated or evidence_truncated or comments_incomplete
+                or merges_incomplete):
             status = "partial"
         elif cells_total == 0:
             return {
