@@ -1,0 +1,25 @@
+name: Build 标镜 update bundle
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build-update-bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - name: Build allow-listed source bundle
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: python3 scripts/build_update_bundle.py "$RELEASE_TAG"
+      - name: Attach bundle to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" "biaojing-source-$RELEASE_TAG.zip" --clobber
