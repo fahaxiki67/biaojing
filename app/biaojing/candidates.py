@@ -916,6 +916,10 @@ def _xlsx_price_line_candidates(evidence: list[dict]) -> list[dict]:
                 if parsed_price and parsed_price["status"] != "normalized":
                     line["unit_price"] = None
                     if parsed_price["status"] == "needs_unit":
+                        # 保留原金额文本，让人工可在逐行确认界面选择元/万元；
+                        # 规则仍只消费经确认归一到元的 unit_price。
+                        line["unit_price_raw"] = parsed_price["raw"]
+                        line["amount_unit"] = "unknown"
                         locator = (price_cell.get("locator") if price_cell
                                    else f"{sheet}!{price_col[0]}{row_no}")
                         group_notes[group_key].add(

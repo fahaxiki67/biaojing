@@ -253,6 +253,145 @@ class PriceLinesEvidenceRegistryTests(unittest.TestCase):
         state3 = self._get_json("/api/state")
         self.assertEqual(state3["source_rows"][0]["status"], "success")
 
+    def test_unknown_price_unit_can_be_confirmed_per_line_without_rounding(self):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(["投标人名称", "清单编码", "清单名称", "规格型号",
+                   "单位", "币种", "是否含税", "综合单价"])
+        for bidder, price in (("甲公司", 100), ("乙公司", 110),
+                              ("丙公司", 120)):
+            ws.append([bidder, "A1", "电线", "BV", "台", "CNY",
+                       "含税", price])
+        ws.append(["甲公司", "B1", "待核单位项", "100", "台", "CNY",
+                   "含税", 100])
+        ws.append(["甲公司", "C1", "小数项", "0.29", "台", "CNY",
+                   "含税", 0.29])
+        ws.append(["甲公司", "D1", "外币项", "USD 7", "台", None,
+                   "含税", "USD 7"])
+        buf = io.BytesIO()
+        wb.save(buf)
+        req = urllib.request.Request(
+            self.base + "/api/upload?name=unknown-unit.xlsx",
+            data=buf.getvalue(), method="POST",
+            headers={"Content-Type": "application/octet-stream",
+                     "Origin": self.base})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            self.assertTrue(json.load(resp)["ok"])
+
+        state = self._get_json("/api/state")
+        groups = [c for c in state["candidates"]
+                  if c["field"] == "price_lines"]
+        self.assertEqual(len(groups), 3)
+        bidder_for = {"100": "SYN-BIDDER-01", "110": "SYN-BIDDER-02",
+                      "120": "SYN-BIDDER-03"}
+        for group in groups:
+            lines = group["value"]
+            line = lines[0]
+            self.assertIsNone(line["unit_price"])
+            amount = line.get("unit_price_raw")
+            self.assertIn(amount, bidder_for,
+                          "needs_unit 报价行必须保留可复核的原始金额")
+            for line in lines:
+                line["amount_unit"] = (
+                    "unknown" if line["item_code"] == "B1" else
+                    "yuan" if line["item_code"] in ("C1", "D1") else
+                    "ten_thousand_yuan")
+                if line["item_code"] == "B1":
+                    # 模拟篡改/旧客户端残留值：单位待核时 API 必须清空
+                    # unit_price，避免原始数值被规则误用。
+                    line.pop("amount_unit")
+                    line["unit_price"] = "999"
+            result = self._post_json("/api/confirm", {
+                "event_id": "EV-SYN-001", "lot_id": "SYN-LOT-001",
+                "bidder_id": bidder_for[amount], "field": "price_lines",
+                "value": lines, "evidence_id": group["evidence_id"],
+                "action": "correct", "reviewer_type": "test"})
+            self.assertTrue(result.get("ok"), result)
+
+        facts = self.wb.build_p2_facts()
+        from decimal import Decimal
+        bids = {bid["bidder_id"]: bid
+                for bid in facts["events"][0]["lots"][0]["bids"]}
+        prices = {bidder: Decimal(str(next(
+            line["unit_price"] for line in bid["price_lines"]
+            if line["item_code"] == "A1")))
+                  for bidder, bid in bids.items()}
+        self.assertEqual(prices, {"SYN-BIDDER-01": Decimal("1000000"),
+                                  "SYN-BIDDER-02": Decimal("1100000"),
+                                  "SYN-BIDDER-03": Decimal("1200000")})
+        unknown_unit_line = next(
+            line for line in bids["SYN-BIDDER-01"]["price_lines"]
+            if line["item_code"] == "B1")
+        self.assertIsNone(unknown_unit_line["unit_price"])
+        decimal_line = next(line for line in bids["SYN-BIDDER-01"]["price_lines"]
+                            if line["item_code"] == "C1")
+        self.assertEqual(Decimal(str(decimal_line["unit_price"])), Decimal("0.29"))
+        foreign_line = next(line for line in bids["SYN-BIDDER-01"]["price_lines"]
+                            if line["item_code"] == "D1")
+        self.assertEqual(Decimal(str(foreign_line["unit_price"])), Decimal("7"))
+        self.assertEqual(foreign_line["currency"], "USD")
+        screened = self._post_json("/api/screen", {})
+        r004 = [f for f in screened["findings"] if f["rule_id"] == "R004"
+                and f.get("signal") in ("线索", "弱线索")]
+        self.assertTrue(r004, f"确认单位后的金额应进入 R004 可比组：{screened}")
+
+    def test_invalid_confirmed_amount_unit_is_rejected_without_history(self):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(["投标人名称", "清单编码", "清单名称", "规格型号",
+                   "单位", "币种", "是否含税", "综合单价"])
+        ws.append(["甲公司", "A1", "电线", "BV", "台", "CNY", "含税", 100])
+        buf = io.BytesIO()
+        wb.save(buf)
+        req = urllib.request.Request(
+            self.base + "/api/upload?name=invalid-unit.xlsx",
+            data=buf.getvalue(), method="POST",
+            headers={"Content-Type": "application/octet-stream",
+                     "Origin": self.base})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            self.assertTrue(json.load(resp)["ok"])
+        group = next(c for c in self._get_json("/api/state")["candidates"]
+                     if c["field"] == "price_lines")
+        lines = group["value"]
+        lines[0]["amount_unit"] = "invented"
+        result = self._post_json("/api/confirm", {
+            "event_id": "EV-SYN-001", "lot_id": "SYN-LOT-001",
+            "bidder_id": "SYN-BIDDER-01", "field": "price_lines",
+            "value": lines, "evidence_id": group["evidence_id"],
+            "action": "correct", "reviewer_type": "test"})
+        self.assertFalse(result.get("ok"))
+        self.assertIn("金额单位", result.get("error", ""))
+        lines[0]["amount_unit"] = "yuan"
+        lines[0]["unit_price_raw"] = "USD 100"
+        lines[0]["currency"] = "CNY"
+        result = self._post_json("/api/confirm", {
+            "event_id": "EV-SYN-001", "lot_id": "SYN-LOT-001",
+            "bidder_id": "SYN-BIDDER-01", "field": "price_lines",
+            "value": lines, "evidence_id": group["evidence_id"],
+            "action": "correct", "reviewer_type": "test"})
+        self.assertFalse(result.get("ok"))
+        self.assertIn("币种与确认币种冲突", result.get("error", ""))
+        lines[0]["unit_price_raw"] = "100"
+        lines[0]["currency"] = []
+        result = self._post_json("/api/confirm", {
+            "event_id": "EV-SYN-001", "lot_id": "SYN-LOT-001",
+            "bidder_id": "SYN-BIDDER-01", "field": "price_lines",
+            "value": lines, "evidence_id": group["evidence_id"],
+            "action": "correct", "reviewer_type": "test"})
+        self.assertFalse(result.get("ok"))
+        self.assertIn("币种", result.get("error", ""))
+        lines[0]["currency"] = "CNY"
+        lines[0]["unit_price_raw"] = ["100"]
+        result = self._post_json("/api/confirm", {
+            "event_id": "EV-SYN-001", "lot_id": "SYN-LOT-001",
+            "bidder_id": "SYN-BIDDER-01", "field": "price_lines",
+            "value": lines, "evidence_id": group["evidence_id"],
+            "action": "correct", "reviewer_type": "test"})
+        self.assertFalse(result.get("ok"))
+        self.assertIn("原始单价", result.get("error", ""))
+        self.assertEqual(self.wb.conn.execute(
+            "SELECT COUNT(*) FROM confirmation_history").fetchone()[0], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

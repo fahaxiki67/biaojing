@@ -41,6 +41,10 @@ INDEX_HTML = """<!DOCTYPE html>
  #uploadLog{white-space:pre-wrap;overflow-wrap:anywhere}
  #taskPanel{display:flex;align-items:center;gap:10px;margin-top:8px}
  .cand details{min-width:220px}.cand textarea{width:230px;min-height:48px}
+ .priceLineEditor{display:grid;gap:8px;margin:8px 0;max-height:320px;overflow:auto}
+ .priceLine{border:1px solid #e2e5ea;border-radius:5px;padding:8px;display:grid;gap:6px}
+ .priceLine label{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+ .priceLine input,.priceLine select{max-width:210px;box-sizing:border-box}
  .ruleStatus{border:1px solid #edf0f3;border-radius:5px;padding:8px;margin:5px 0}
  .finding{overflow-wrap:anywhere}
 </style>
@@ -433,11 +437,61 @@ function renderCands(st){
     tr.appendChild(el("td",c.note||"","dim"));
     const td=el("td");
     const mk=(label,cls,fn)=>{const b=el("button",label,cls);b.addEventListener("click",fn);return b};
-    let fix;
+    let fix,priceLineEditors=[];
     if(c.field==="price_lines"){
       const details=el("details"),summary=el("summary","查看 / 编辑全部报价行");
+      details.appendChild(summary);
+      details.appendChild(el("p","按行核对后点“更正”保存；“确认”保留原候选值。","dim"));
+      const editor=el("div",null,"priceLineEditor");
+      c.value.forEach((line,index)=>{
+        const currencyOptions=[["unknown","待核"],["CNY","人民币 CNY"],
+          ["USD","美元 USD"],["EUR","欧元 EUR"],["GBP","英镑 GBP"],
+          ["JPY","日元 JPY"],["HKD","港币 HKD"]];
+        const row=el("div",null,"priceLine");
+        const label=[line.item_code,line.item_name,line.spec]
+          .filter(v=>v&&v!=="unknown").join(" / ")||("第 "+(index+1)+" 行");
+        row.appendChild(el("strong",label));
+        const unit=el("input");unit.placeholder="计量单位（如 台）";
+        unit.value=line.unit&&line.unit!=="unknown"?String(line.unit):"";
+        unit.dataset.priceLineField="unit";
+        const rawPrice=el("input");rawPrice.placeholder="单价原文";
+        rawPrice.value=line.unit_price_raw!=null?String(line.unit_price_raw)
+          :line.unit_price!=null?String(line.unit_price):"";
+        rawPrice.dataset.priceLineField="unit_price_raw";
+        const amountUnit=el("select");
+        for(const p of [["unknown","金额尺度：待核"],
+          ["yuan","金额尺度：元（×1）"],
+          ["ten_thousand_yuan","金额尺度：万元（×10000）"]])
+          option(amountUnit,p[0],p[1]);
+        amountUnit.value=line.amount_unit||
+          (line.unit_price!=null?"yuan":"unknown");
+        amountUnit.dataset.priceLineField="amount_unit";
+        const currency=el("select");
+        const currencyValue=String(line.currency||"unknown");
+        if(!currencyOptions.some(p=>p[0]===currencyValue))
+          currencyOptions.push([currencyValue,currencyValue]);
+        for(const p of currencyOptions)option(currency,p[0],"币种："+p[1]);
+        currency.value=currencyValue;
+        currency.dataset.priceLineField="currency";
+        const tax=el("select");
+        for(const p of [["unknown","税口径：待核"],["true","含税"],
+          ["false","不含税"]])option(tax,p[0],p[1]);
+        tax.value=typeOfTax(line.tax_included);
+        tax.dataset.priceLineField="tax_included";
+        const addControl=(caption,control)=>{
+          const field=el("label",caption);field.appendChild(control);row.appendChild(field);
+        };
+        addControl("计量单位",unit);addControl(
+          line.unit_price_raw!=null?"原始单价":"单价（按所选金额单位）",rawPrice);
+        addControl("金额单位",amountUnit);addControl("币种",currency);
+        addControl("税口径",tax);editor.appendChild(row);
+        priceLineEditors.push({index,unit,rawPrice,amountUnit,currency,tax});
+      });
+      details.appendChild(editor);
+      const advanced=el("details"),advancedSummary=el("summary","高级：编辑完整报价行 JSON");
       fix=document.createElement("textarea");fix.value=JSON.stringify(c.value,null,2);fix.dataset.cid=c.id;
-      details.appendChild(summary);details.appendChild(fix);td.appendChild(details);
+      advanced.appendChild(advancedSummary);advanced.appendChild(fix);
+      details.appendChild(advanced);td.appendChild(details);
     }else{
       fix=document.createElement("input");fix.placeholder="更正值";fix.style.width="120px";fix.dataset.cid=c.id;
       if(c.field==="total_price"&&c.value)fix.value=c.value.raw||"";
@@ -446,7 +500,8 @@ function renderCands(st){
     }
     td.appendChild(mk("查看证据","ghost",()=>showEv(c.evidence_id)));
     td.appendChild(mk("确认","",()=>doConfirm(c,"confirm",null)));
-    td.appendChild(mk("更正","ghost",()=>doConfirm(c,"correct",fix.value)));
+    td.appendChild(mk("更正","ghost",()=>doConfirm(c,"correct",fix.value,
+      priceLineEditors)));
     td.appendChild(mk("标 unknown","ghost",()=>doConfirm(c,"unknown",null)));
     if(CONTACT_FIELDS.has(c.field)){
       const sel=document.createElement("select");sel.dataset.cid=c.id;sel.className="roleSel";
@@ -474,7 +529,8 @@ function renderCands(st){
 }
 $("#moreCandidates").addEventListener("click",()=>loadState("candidates"));
 $("#moreSources").addEventListener("click",()=>loadState("sources"));
-async function doConfirm(cand,action,fixValue){
+function typeOfTax(value){return typeof value==="boolean"?(value?"true":"false"):"unknown"}
+async function doConfirm(cand,action,fixValue,lineEditors=[]){
   const eid=$("#eid").value.trim(),lid=$("#lid").value.trim(),bid=$("#bid").value.trim();
   if(!eid||!lid||!bid){toast("请先填写事件 / 标段 / 主体 ID");return}
   const original=JSON.stringify(cand.value);
@@ -498,6 +554,18 @@ async function doConfirm(cand,action,fixValue){
     if(!fixValue){toast("请输入更正值");return}
     if(cand.field==="price_lines"){
       try{value=JSON.parse(fixValue)}catch(_){toast("报价行 JSON 格式有误");return}
+      if(!Array.isArray(value)){toast("报价行必须是行列表");return}
+      const advancedJsonEdited=fixValue!==JSON.stringify(cand.value,null,2);
+      for(const editor of (advancedJsonEdited?[]:lineEditors)){
+        const line=value[editor.index];
+        if(!line||typeof line!=="object")continue;
+        line.unit=editor.unit.value.trim()||"unknown";
+        line.currency=editor.currency.value||"unknown";
+        line.tax_included=editor.tax.value==="unknown"?null:editor.tax.value==="true";
+        line.unit_price_raw=editor.rawPrice.value.trim()||null;
+        line.amount_unit=editor.amountUnit.value||"unknown";
+        if(!line.unit_price_raw||line.amount_unit==="unknown")line.unit_price=null;
+      }
     }else value=fixValue;
   }
   const roleSel=document.querySelector('.roleSel[data-cid="'+cand.id+'"]');

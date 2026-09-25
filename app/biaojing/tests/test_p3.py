@@ -1151,7 +1151,7 @@ global.document={querySelector:s=>(els[s]=els[s]||makeEl()),
   createTextNode:t=>({textContent:t,_kids:[]})};
 global.window={open(){}};
 global.setTimeout=()=>0;
-global.fetch=async(url,opt)=>{calls.push({url});
+global.fetch=async(url,opt)=>{calls.push({url,opt:opt||{}});
   if(url.indexOf("/api/state")===0){
     const state=JSON.parse(JSON.stringify(STATE));
     const sourceOffset=Number(new URL(url,"http://local").searchParams.get("source_offset")||0);
@@ -1166,6 +1166,8 @@ global.fetch=async(url,opt)=>{calls.push({url});
     return {ok:true,status:200,json:async()=>EV};
   if(url==="/api/screen")
     return {ok:false,status:400,json:async()=>({error:"确认数据无法筛查：类型无效"})};
+  if(url==="/api/confirm")
+    return {ok:true,status:200,json:async()=>({ok:true})};
   if(url==="/api/retry_ocr")
     return {ok:true,status:200,json:async()=>({job_id:"job-test"})};
   if(url==="/api/jobs/job-test")
@@ -1235,11 +1237,57 @@ function collect(n,out){out=out||[];if(!n||!n._kids)return out;
   const screenError=T.els["#toast"].textContent;
   await T.waitForJob("job-docx","Word OCR");
   const docxTaskText=T.els["#taskText"].textContent;
+  const confirmCallsBeforePriceEditor=calls.filter(c=>c.url==="/api/confirm").length;
+  for(const selector of ["#eid","#lid","#bid"])
+    T.els[selector]=T.els[selector]||makeEl();
+  T.els["#eid"].value="EV-SYN-001";T.els["#lid"].value="SYN-LOT-001";
+  T.els["#bid"].value="SYN-BIDDER-01";
+  T.els["#cands"]._kids=[];
+  T.renderCands({candidates:[{id:42,field:"price_lines",value:[{
+    item_code:"A1",item_name:"电线",spec:"BV",unit:"unknown",
+    unit_price:null,unit_price_raw:"100",amount_unit:"unknown",
+    currency:"unknown",tax_included:null,evidence:"E-line-42",
+    field_evidence:{unit_price:"E-line-42"}}],
+    evidence_id:"E-line-42",locator_display:"报价!H2",note:"金额单位待核"}],
+    candidate_total:1,candidate_has_more:false});
+  const priceControls=collect(T.els["#cands"]).filter(n=>n.dataset
+    &&n.dataset.priceLineField);
+  const controlByField=Object.fromEntries(priceControls.map(n=>
+    [n.dataset.priceLineField,n]));
+  controlByField.unit.value="台";controlByField.unit_price_raw.value="100";
+  controlByField.amount_unit.value="ten_thousand_yuan";
+  controlByField.currency.value="CNY";controlByField.tax_included.value="true";
+  const correctButton=collect(T.els["#cands"]).find(n=>n.textContent==="更正"
+    &&n._handlers&&n._handlers.click);
+  await correctButton._handlers.click();
+  const priceConfirm=calls.filter(c=>c.url==="/api/confirm").slice(-1)[0];
+  const priceLineValue=JSON.parse(priceConfirm.opt.body).value[0];
+  const advancedLine={item_code:"A2",item_name:"钢筋",spec:"HRB400",
+    unit:"unknown",unit_price:null,unit_price_raw:"200",amount_unit:"unknown",
+    currency:"unknown",tax_included:null,evidence:"E-line-43",
+    field_evidence:{unit_price:"E-line-43"}};
+  T.els["#cands"]._kids=[];
+  T.renderCands({candidates:[{id:43,field:"price_lines",value:[advancedLine],
+    evidence_id:"E-line-43",locator_display:"报价!H3",note:"金额单位待核"}],
+    candidate_total:1,candidate_has_more:false});
+  const advancedControls=collect(T.els["#cands"]).filter(n=>n.dataset
+    &&n.dataset.priceLineField);
+  const advancedByField=Object.fromEntries(advancedControls.map(n=>
+    [n.dataset.priceLineField,n]));
+  advancedByField.unit.value="控件单位";
+  const advancedJson=collect(T.els["#cands"]).find(n=>n.dataset
+    &&n.dataset.cid==43);
+  advancedJson.value=JSON.stringify([{...advancedLine,unit:"JSON单位"}],null,2);
+  const advancedButton=collect(T.els["#cands"]).find(n=>n.textContent==="更正"
+    &&n._handlers&&n._handlers.click);
+  await advancedButton._handlers.click();
+  const advancedConfirm=calls.filter(c=>c.url==="/api/confirm").slice(-1)[0];
+  const advancedLineValue=JSON.parse(advancedConfirm.opt.body).value[0];
   console.log(JSON.stringify({calls:T.calls,
     log:T.els["#uploadLog"].textContent, clickLog:T.clickLog,
     evCalls:calls.filter(c=>c.url.indexOf("/api/evidence/")===0)
       .map(c=>c.url),
-    confirmCalls:calls.filter(c=>c.url.indexOf("/api/confirm")===0).length,
+    confirmCalls:confirmCallsBeforePriceEditor,priceLineValue,advancedLineValue,
     panelText, panelCount:T.els["#findings"]._kids.length,
     findingsBox, findingsPanelCount:fbKids.length,sourceText,retryButtonText,
     retryCalls:retryCalls.length,jobPollCalls:jobPollCalls.length,screenError,
@@ -1342,6 +1390,21 @@ function collect(n,out){out=out||[];if(!n||!n._kids)return out;
         self.assertIn("下载原始文件", pt)
         self.assertIn("paragraph 8", pt)       # 定位
         self.assertIn("本机 OCR 机器识别文本，请对照原件复核", pt)
+
+    def test_price_line_unit_editor_submits_structured_values(self):
+        # P2-10：逐行金额单位/计量单位/币种/税口径通过控件写回完整行，
+        # 不要求用户手改整段 JSON。
+        line = json.loads(self.proc.stdout)["priceLineValue"]
+        self.assertEqual(line["unit"], "台")
+        self.assertEqual(line["unit_price_raw"], "100")
+        self.assertEqual(line["amount_unit"], "ten_thousand_yuan")
+        self.assertEqual(line["currency"], "CNY")
+        self.assertIs(line["tax_included"], True)
+
+    def test_advanced_price_json_is_not_overwritten_by_stale_controls(self):
+        # 高级 JSON 修改整行后，初始结构化控件不能再覆盖它。
+        line = json.loads(self.proc.stdout)["advancedLineValue"]
+        self.assertEqual(line["unit"], "JSON单位")
 
     def test_page_served_with_no_store(self):
         from biaojing import webapp

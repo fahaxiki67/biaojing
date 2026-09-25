@@ -881,13 +881,50 @@ class Workbench:
             if not isinstance(value, list) or not value:
                 return {"ok": False, "error": "清单报价须为非空行列表"}
             from .money import parse_amount
+            normalized_lines = []
             for index, line in enumerate(value, start=1):
                 if not isinstance(line, dict):
                     return {"ok": False, "error": f"第 {index} 条清单行格式错误"}
+                line = dict(line)
                 line_evidence = line.get("evidence")
                 if not self.evidence_usable(line_evidence):
                     return {"ok": False,
                             "error": f"第 {index} 条清单行缺少有效单价证据"}
+                amount_unit = line.get("amount_unit", "unknown")
+                if amount_unit not in ("unknown", "yuan", "ten_thousand_yuan"):
+                    return {"ok": False,
+                            "error": f"第 {index} 条金额单位只接受元、万元或待核"}
+                currency = line.get("currency", "unknown")
+                if currency is not None and not isinstance(currency, str):
+                    return {"ok": False, "error": f"第 {index} 条币种必须是字符串"}
+                raw_amount = line.get("unit_price_raw")
+                if raw_amount is not None:
+                    if isinstance(raw_amount, bool) or not isinstance(
+                            raw_amount, (str, int, float)):
+                        return {"ok": False,
+                                "error": f"第 {index} 条原始单价必须是文本或数值"}
+                if amount_unit == "unknown" and (
+                        "amount_unit" in line or raw_amount is not None):
+                    # 客户端显式标记金额单位待核时，不能让旧的/伪造的
+                    # unit_price 绕过单位确认进入 R004。
+                    line["unit_price"] = None
+                if raw_amount is not None and amount_unit != "unknown":
+                    parsed = parse_amount(raw_amount, amount_unit)
+                    if parsed["status"] != "normalized":
+                        return {"ok": False,
+                                "error": f"第 {index} 条原始单价无法按所选金额单位归一："
+                                         f"{parsed['status']}"}
+                    if parsed["currency"] not in ("unknown", currency) \
+                            and currency not in (None, "", "unknown"):
+                        return {"ok": False,
+                                "error": f"第 {index} 条原始单价币种与确认币种冲突"}
+                    if currency in (None, "", "unknown") \
+                            and parsed["currency"] != "unknown":
+                        line["currency"] = parsed["currency"]
+                    # parse_amount 以 Decimal 文本归一，后续仍走逐值
+                    # float 往返校验；不能精确保存时显式拒绝，不舍入。
+                    line["unit_price"] = parsed["amount_yuan"]
+                normalized_lines.append(line)
                 price = line.get("unit_price")
                 if price is not None:
                     # 精度边界（复核六轮）：SQLite bid_price_lines.unit_price
@@ -922,6 +959,7 @@ class Workbench:
                         not self.evidence_usable(eid)
                         for eid in field_evidence.values() if eid):
                     return {"ok": False, "error": f"第 {index} 条清单行字段证据无效"}
+            value = normalized_lines
         if field == "outcome_result" and action in ("confirm", "correct"):
             text = str(value).strip().casefold()
             if any(x in text for x in ("未中标", "未中", "落标", "未获得", "否", "lost")):
