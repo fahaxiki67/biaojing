@@ -876,21 +876,25 @@ class Workbench:
                     # 精度边界（复核六轮）：SQLite bid_price_lines.unit_price
                     # 为 REAL。字符串单价仅当 float 最短 repr 能精确还原原
                     # 十进制（Decimal(str(float(d))) == d，如 0.29、100）才
-                    # 接受；超出可精确表示范围（如 25 位有效数字）显式拒绝，
-                    # 绝不静默舍入。
+                    # 接受；逐值判定、非位数上限——更长但可精确往返的值
+                    # 同样通过。超出范围显式拒绝，绝不静默舍入。
                     from decimal import Decimal as _decimal
                     try:
                         as_decimal = _decimal(str(price).strip())
                         round_trip = _decimal(str(float(as_decimal)))
-                    except (ValueError, OverflowError):
+                    except (ValueError, ArithmeticError):
+                        # InvalidOperation 属 ArithmeticError：'abc' 等接口
+                        # 信任边界上的非法字符串走结构化失败而非 500
+                        # （复核七轮）
                         return {"ok": False,
-                                "error": f"第 {index} 条单价不是有效十进制数"}
+                                "error": (f"第 {index} 条单价 {price!r} "
+                                          "不是有效十进制数")}
                     if round_trip != as_decimal:
                         return {"ok": False,
-                                "error": (f"第 {index} 条单价 {price!r} 超出"
-                                          "可精确表示范围（≤15 位有效数字），"
-                                          "为避免静默舍入已拒绝；请按原件核对"
-                                          "后缩位后重新确认")}
+                                "error": (f"第 {index} 条单价 {price!r} 无法"
+                                          "以浮点精确往返表示（逐值校验，"
+                                          "非位数上限），为避免静默舍入已"
+                                          "拒绝；请按原件核对金额后重新确认")}
                     if parse_amount(str(price), "yuan")["status"] != "normalized":
                         return {"ok": False, "error": f"第 {index} 条单价不是有限金额"}
                 tax = line.get("tax_included")
@@ -1337,7 +1341,7 @@ class Workbench:
                         try:
                             as_decimal = _decimal(line["unit_price"].strip())
                             as_float = float(as_decimal)
-                        except (ValueError, OverflowError):
+                        except (ValueError, ArithmeticError):
                             as_float = None
                         if as_float is not None \
                                 and _decimal(str(as_float)) == as_decimal:

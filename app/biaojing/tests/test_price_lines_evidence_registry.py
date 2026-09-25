@@ -19,6 +19,7 @@ import json
 import tempfile
 import threading
 import unittest
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -209,7 +210,48 @@ class PriceLinesEvidenceRegistryTests(unittest.TestCase):
             "value": lines, "evidence_id": pl["evidence_id"],
             "action": "confirm"})
         self.assertFalse(res.get("ok"), "超精度单价被静默接受")
-        self.assertIn("精确", res.get("error", ""))
+        self.assertNotIn("15", res.get("error", ""),
+                         "错误提示不得写死位数上限（实际是逐值精确往返判定）")
+
+    def test_non_numeric_price_returns_structured_error(self):
+        # 复核七轮：'abc' 曾触发 decimal.InvalidOperation 未捕获 → 500。
+        # 接口信任边界上的非法字符串必须返回结构化失败、确认数不变、
+        # 服务不中断。
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(["投标人名称", "综合单价(元)", "清单名称", "规格型号"])
+        ws.append(["甲公司", 100, "电线", "BV"])
+        buf = io.BytesIO()
+        wb.save(buf)
+        req = urllib.request.Request(
+            self.base + "/api/upload?name=bad.xlsx", data=buf.getvalue(),
+            method="POST",
+            headers={"Content-Type": "application/octet-stream",
+                     "Origin": self.base})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            self.assertTrue(json.load(resp)["ok"])
+        state = self._get_json("/api/state")
+        pl = next(c for c in state["candidates"]
+                  if c["field"] == "price_lines")
+        lines = pl["value"] if isinstance(pl["value"], list) \
+            else json.loads(pl["value"])
+        lines[0]["unit_price"] = "abc"
+        try:
+            res = self._post_json("/api/confirm", {
+                "event_id": "EV-B", "lot_id": "LOT-B",
+                "bidder_id": "SYN-BIDDER-01", "field": "price_lines",
+                "value": lines, "evidence_id": pl["evidence_id"],
+                "action": "confirm"})
+        except urllib.error.HTTPError as exc:
+            self.fail(f"非法单价触发 HTTP {exc.code}（应为结构化失败）")
+        self.assertFalse(res.get("ok"), "非数值单价被静默接受")
+        self.assertTrue(res.get("error"), "结构化失败须带可读 error")
+        state2 = self._get_json("/api/state")
+        self.assertEqual(state2.get("confirmation_count"), 0,
+                         "被拒确认不得改变确认计数")
+        # 服务不中断
+        state3 = self._get_json("/api/state")
+        self.assertEqual(state3["source_rows"][0]["status"], "success")
 
 
 if __name__ == "__main__":
