@@ -872,8 +872,27 @@ class Workbench:
                     return {"ok": False,
                             "error": f"第 {index} 条清单行缺少有效单价证据"}
                 price = line.get("unit_price")
-                if price is not None and parse_amount(price, "yuan")["status"] != "normalized":
-                    return {"ok": False, "error": f"第 {index} 条单价不是有限金额"}
+                if price is not None:
+                    # 精度边界（复核六轮）：SQLite bid_price_lines.unit_price
+                    # 为 REAL。字符串单价仅当 float 最短 repr 能精确还原原
+                    # 十进制（Decimal(str(float(d))) == d，如 0.29、100）才
+                    # 接受；超出可精确表示范围（如 25 位有效数字）显式拒绝，
+                    # 绝不静默舍入。
+                    from decimal import Decimal as _decimal
+                    try:
+                        as_decimal = _decimal(str(price).strip())
+                        round_trip = _decimal(str(float(as_decimal)))
+                    except (ValueError, OverflowError):
+                        return {"ok": False,
+                                "error": f"第 {index} 条单价不是有效十进制数"}
+                    if round_trip != as_decimal:
+                        return {"ok": False,
+                                "error": (f"第 {index} 条单价 {price!r} 超出"
+                                          "可精确表示范围（≤15 位有效数字），"
+                                          "为避免静默舍入已拒绝；请按原件核对"
+                                          "后缩位后重新确认")}
+                    if parse_amount(str(price), "yuan")["status"] != "normalized":
+                        return {"ok": False, "error": f"第 {index} 条单价不是有限金额"}
                 tax = line.get("tax_included")
                 if tax is not None and type(tax) is not bool:
                     return {"ok": False, "error": f"第 {index} 条税口径只能为布尔值或 unknown"}
@@ -1305,7 +1324,32 @@ class Workbench:
                                   "result": str(value) if st == "known" else None,
                                   **({"evidence": ev_id} if ev_id else {})}
             elif field == "price_lines" and isinstance(value, list):
-                bid.setdefault("price_lines", []).extend(value)
+                # 共享根因修复（复核五/六轮）：确认值里的字符串单价在此
+                # 归一为 float（仅接受确认入口已验证可精确往返的值），
+                # 否则事件导入按"unit_price 非数值"整事件拒绝；同时把
+                # 每一行的单价证据与字段证据注册进 facts 证据注册表——
+                # 只登记确认行顶层证据曾让第 2 行起全部"证据缺失/无效"。
+                from decimal import Decimal as _decimal
+                normalized_lines = []
+                for line in value:
+                    if isinstance(line, dict) and isinstance(
+                            line.get("unit_price"), str):
+                        try:
+                            as_decimal = _decimal(line["unit_price"].strip())
+                            as_float = float(as_decimal)
+                        except (ValueError, OverflowError):
+                            as_float = None
+                        if as_float is not None \
+                                and _decimal(str(as_float)) == as_decimal:
+                            line = {**line, "unit_price": as_float}
+                    normalized_lines.append(line)
+                for line in normalized_lines:
+                    ev_json(line.get("evidence"))
+                    for field_eid in (line.get("field_evidence")
+                                      or {}).values():
+                        if field_eid:
+                            ev_json(field_eid)
+                bid.setdefault("price_lines", []).extend(normalized_lines)
             # 其余字段（project_name/code、lot_name 等）当前仅
             # 留档展示，不映射进 P2 规则事实
 
