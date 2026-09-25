@@ -715,6 +715,22 @@ class Workbench:
         }
 
     @_locked
+    def export_last_screen(self) -> dict | None:
+        """最近一次筛查的完整导出（D-04）：facts/outcome 以库内原始
+        JSON 字符串原样返回，便于对 facts_sha256 逐字节现场重算复核。"""
+        row = self.conn.execute(
+            "SELECT id,run_at,rules_version,facts_sha256,facts_json,"
+            "outcome_json,status,error FROM screen_runs"
+            " ORDER BY id DESC LIMIT 1").fetchone()
+        if not row:
+            return None
+        return {"id": row["id"], "run_at": row["run_at"],
+                "rules_version": row["rules_version"],
+                "facts_sha256": row["facts_sha256"],
+                "facts_json": row["facts_json"],
+                "outcome_json": row["outcome_json"],
+                "status": row["status"], "error": row["error"]}
+
     def state(self, candidate_offset: int = 0,
               candidate_limit: int = 200, source_offset: int = 0,
               source_limit: int = 100) -> dict:

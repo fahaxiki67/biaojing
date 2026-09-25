@@ -297,6 +297,26 @@ class Handler(BaseHTTPRequestHandler):
                 info["refs"] = wb.refs_for_sha(info["sha256"])
                 self._send_json(info)
             return
+        if self.path == "/api/screen/last":
+            # D-04：最近一次筛查结果导出（JSON 下载）。Host 校验由
+            # do_GET 入口的 _security_reject 统一覆盖。
+            export = wb.export_last_screen()
+            if export is None:
+                self._send_json({"error": "尚未运行筛查，没有可导出的结果"},
+                                404)
+                return
+            body = json.dumps(export, ensure_ascii=False).encode("utf-8")
+            safe_name = f"screen-export-{export['id']}.json"
+            self.send_response(200)
+            self.send_header("Content-Type",
+                             "application/json; charset=utf-8")
+            self.send_header("Content-Disposition",
+                             f'attachment; filename="{safe_name}"')
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path.startswith("/api/download/"):
             sha = self.path.rsplit("/", 1)[-1].lower()
             # 只接受库中存在的 64 位十六进制 SHA-256；按工作区固定哈希路径

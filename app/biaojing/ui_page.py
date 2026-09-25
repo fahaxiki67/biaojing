@@ -100,6 +100,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <section>
 <h2>四、运行筛查并查看异常</h2>
 <button id="runScreen">基于已确认事实运行筛查</button>
+<button id="exportScreen" disabled title="尚未运行筛查时不可用">导出本次筛查结果（JSON）</button>
 <span id="screenMeta" class="dim" style="margin-left:10px"></span>
 <div id="findings"></div>
 </section>
@@ -403,6 +404,9 @@ async function loadState(page=null){
   }else if(last.status==="failed"){
     $("#screenMeta").textContent="最近一次筛查失败："+(last.error||"详情未记录");
   }else{$("#screenMeta").textContent="尚未运行筛查"}
+  $("#exportScreen").disabled=(last.status==="not_run");
+  $("#exportScreen").title=last.status==="not_run"
+    ?"尚未运行筛查时不可用":"下载最近一次筛查结果（JSON，含事实快照与线索）";
   if(st.last_screen_run.status==="not_run")
     renderFindings({run_status:"not_run",findings:[]});
   else renderFindings({run_status:st.last_screen_run.status,
@@ -559,8 +563,7 @@ function renderHistory(st){
 
 // ---- 筛查 ----
 $("#runScreen").addEventListener("click",async()=>{
-  $("#runScreen").disabled=true;
-  try{
+  $("#runScreen").disabled=true;  try{
     const r=await fetch("/api/screen",{method:"POST",body:"{}"});
     const j=await r.json();
     if(!r.ok||!j.import){renderFindings({run_status:"failed",error:j.error||"筛查失败",findings:[]});toast(j.error||"筛查失败");await loadState();return}
@@ -570,6 +573,18 @@ $("#runScreen").addEventListener("click",async()=>{
     renderFindings(j);await loadState();
   }catch(err){renderFindings({run_status:"failed",error:err.message,findings:[]});toast("筛查失败："+err.message)}
   finally{$("#runScreen").disabled=false}
+});
+$("#exportScreen").addEventListener("click",async()=>{
+  try{
+    const r=await fetch("/api/screen/last");
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok){toast(j.error||"尚无筛查结果可导出");return}
+    const blob=new Blob([JSON.stringify(j,null,2)],{type:"application/json"});
+    const a=el("a");a.href=URL.createObjectURL(blob);
+    a.download="screen-export-"+(j.id||"last")+".json";
+    document.body.appendChild(a);a.click();a.remove();
+    setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+  }catch(err){toast("导出失败："+err.message)}
 });
 function renderFindings(j){
   const box=$("#findings");box.textContent="";
