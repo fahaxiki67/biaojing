@@ -283,11 +283,15 @@ class FactBase:
                 raise ValueError(
                     f"{bid.event_id}/{bid.lot_id}/{bid.bidder_id} tax_included 只接受 True、False 或 None")
             for i, line in enumerate(bid.price_lines, start=1):
-                # None=unknown 在此放行（复核八轮）：公式无缓存等场景产出
-                # None 单价的行由 R004 以「单价缺失」逐行排除并披露，
-                # 不得让整次筛查失败；类型损坏（布尔/非有限值/坏字符串）
-                # 仍在本边界抛出，安全校验不删。
-                if not _finite_amount(line.unit_price, allow_unknown=True):
+                # 仅 None=unknown 放行（复核八/九轮）：公式无缓存等场景
+                # 产出 None 单价的行由 R004 以「单价缺失」逐行排除并披露，
+                # 不得让整次筛查失败。不用 allow_unknown=True——那会连
+                # 字面 'unknown' 字符串一起放行并穿透到 _decimal 崩溃；
+                # 其余非 None 值（含 'unknown'/'abc'/布尔）仍在本边界抛出，
+                # 安全校验不删。
+                if line.unit_price is not None \
+                        and not _finite_amount(line.unit_price,
+                                               allow_unknown=False):
                     raise ValueError(
                         f"{bid.event_id}/{bid.lot_id}/{bid.bidder_id} 清单行 {i} 单价须为有限数值或 None，"
                         f"收到 {line.unit_price!r}")

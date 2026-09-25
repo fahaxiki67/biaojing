@@ -100,6 +100,13 @@ class R004PositivePriceScopeTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 screen({"B1": [100], "B2": [110], "B3": [bad]})
 
+    def test_literal_unknown_string_rejected_not_none(self):
+        # 复核九轮：allow_unknown=True 会连字面 'unknown' 一起放行，
+        # 但 R004 只把 None 当「单价缺失」——'unknown' 字符串必须在
+        # 边界被拒（结构化 ValueError），不得穿透到 _decimal 崩溃
+        with self.assertRaises(ValueError):
+            screen({"B1": [100], "B2": [110], "B3": ["unknown"]})
+
 
 if __name__ == "__main__":
     unittest.main()
