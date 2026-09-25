@@ -389,6 +389,15 @@ class PriceLinesEvidenceRegistryTests(unittest.TestCase):
             "action": "correct", "reviewer_type": "test"})
         self.assertFalse(result.get("ok"))
         self.assertIn("原始单价", result.get("error", ""))
+        lines[0]["unit_price_raw"] = "100"
+        lines[0]["item_code"] = {"invalid": "SYNTH"}
+        result = self._post_json("/api/confirm", {
+            "event_id": "EV-SYN-001", "lot_id": "SYN-LOT-001",
+            "bidder_id": "SYN-BIDDER-01", "field": "price_lines",
+            "value": lines, "evidence_id": group["evidence_id"],
+            "action": "correct", "reviewer_type": "test"})
+        self.assertFalse(result.get("ok"))
+        self.assertIn("item_code", result.get("error", ""))
         self.assertEqual(self.wb.conn.execute(
             "SELECT COUNT(*) FROM confirmation_history").fetchone()[0], 0)
 

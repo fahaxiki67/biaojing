@@ -890,6 +890,12 @@ class Workbench:
                 if not self.evidence_usable(line_evidence):
                     return {"ok": False,
                             "error": f"第 {index} 条清单行缺少有效单价证据"}
+                for key in ("item_code", "item_name", "spec", "unit"):
+                    try:
+                        hash(line.get(key))
+                    except TypeError:
+                        return {"ok": False,
+                                "error": f"第 {index} 条清单行字段 {key} 必须是标量"}
                 amount_unit = line.get("amount_unit", "unknown")
                 if amount_unit not in ("unknown", "yuan", "ten_thousand_yuan"):
                     return {"ok": False,
