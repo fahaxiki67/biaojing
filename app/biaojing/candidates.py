@@ -13,6 +13,11 @@
     原字符串另存 locator_display 供界面展示。
     - 清单单元格只对明确表头给出列建议；"总报价(万元)"等带单位表头显式
       按单位换算（×10000）并在说明中标注，绝不静默错标。
+    - 中标结果语义归一（_outcome_value）：中标候选/候选推荐=candidate、
+      最终中标/中标人=won、否决/废标=rejected、无效/无效标=invalid、
+      未中标/落标=lost、识别不了=unknown，绝不猜。
+    - 公式单元格的有效值取 cached_value；缓存缺失（"unknown"）或错误值
+      （"#REF!" 等）一律降级为 None/留空，绝不解析公式串本身。
 """
 
 from __future__ import annotations
@@ -44,6 +49,7 @@ FIELD_LABELS = {
     "uscc": ("统一社会信用代码", "信用代码"),
     "id_number": ("身份证件号码", "证件号码"),
     "reg_number": ("注册编号",),
+    "taxpayer_id": ("纳税人识别号",),
 }
 
 def _build_label_pattern() -> re.Pattern:
@@ -60,6 +66,9 @@ def _build_label_pattern() -> re.Pattern:
 
 
 _LABEL_RE = _build_label_pattern()
+
+# 纳税人识别号（18 位，GB 32100 字符集：数字 + 去除 I/O/S/V/Z 的大写字母）
+_TAXPAYER_ID_RE = re.compile(r"[0-9A-HJ-NPQRTUWXY]{18}(?![0-9A-Za-z])")
 
 _LABEL_TO_FIELD = {}
 for _field, _lbs in FIELD_LABELS.items():
@@ -151,7 +160,9 @@ def _extract_pairs(text: str) -> list[tuple[str, str]]:
     """从一行/一段文本中按标签切出 (字段, 值) 对。
 
     带冒号的标签作为切分锚点（值止于下一个锚点）；无冒号匹配仅接受
-    total_price 且数值可解析（其余无冒号切分噪声过大，留给人工）。
+    total_price（数值可解析）与 taxpayer_id（紧邻 18 位统一代码字符集，
+    见 GB 32100：数字 + A-H/J-N/P/Q/R/T/U/W/X/Y，不含 I/O/S/V/Z），
+    其余无冒号切分噪声过大，留给人工。
     """
     pairs = []
     matches = list(_LABEL_RE.finditer(text))
@@ -171,12 +182,16 @@ def _extract_pairs(text: str) -> list[tuple[str, str]]:
         if m in anchors:
             continue
         field = _LABEL_TO_FIELD.get(m.group(0).rstrip(":：").strip())
-        if field != "total_price":
-            continue
-        end = next((a.start() for a in anchors if a.start() > m.start()), len(text))
-        value = re.split(r"[，；。\n（(]", text[m.end():end], maxsplit=1)[0].strip()
-        if parse_amount(value)["number"] is not None:
-            pairs.append(("total_price", value))
+        if field == "total_price":
+            end = next((a.start() for a in anchors if a.start() > m.start()), len(text))
+            value = re.split(r"[，；。\n（(]", text[m.end():end], maxsplit=1)[0].strip()
+            if parse_amount(value)["number"] is not None:
+                pairs.append(("total_price", value))
+        elif field == "taxpayer_id":
+            # 无冒号变体：仅当紧邻的就是 18 位代码本体才给候选，绝不猜
+            hit = _TAXPAYER_ID_RE.match(text, m.end())
+            if hit:
+                pairs.append(("taxpayer_id", hit.group(0)))
     return pairs
 
 
@@ -243,6 +258,7 @@ HEADER_LABELS = {
     "数量": ("qty", "unknown"),
     "综合单价(元)": ("unit_price", "yuan"),
     "综合单价": ("unit_price", "unknown"),
+    "综合单价(万元)": ("unit_price", "ten_thousand_yuan"),
     "币种": ("currency", "unknown"),
     "是否含税": ("tax_included", "unknown"),
     "中标结果": ("outcome_result", "unknown"),
@@ -255,6 +271,7 @@ HEADER_LABELS = {
     "法定代表人": ("legal_rep", 1),
     "身份证件号码": ("id_number", 1),
     "证件号码": ("id_number", 1),
+    "纳税人识别号": ("taxpayer_id", 1),
     "联系电话": ("contact_phone", 1),
     "电话": ("contact_phone", 1),
     "电子邮箱": ("contact_email", 1),
@@ -265,20 +282,80 @@ HEADER_LABELS = {
 }
 
 
+# 中标结果语义归一：按优先级命中第一类；顺序即语义边界——
+# 「中标候选人」同时含「中标」「候选」，必须先判候选；「否决」含「否」，
+# 必须先于普通落标；都认不出就落 unknown，绝不猜。
+_OUTCOME_RULES = (
+    ("candidate", ("候选", "拟中标", "预中标", "推荐中标")),
+    ("rejected", ("否决", "废标")),
+    ("invalid", ("无效",)),
+    ("lost", ("未中标", "未中", "落标", "未获得", "否")),
+    ("won", ("中标", "是")),
+)
+
+
 def _outcome_value(value):
     text = str(value).strip().casefold()
-    if any(token in text for token in ("未中标", "未中", "落标", "未获得", "否")):
-        return "lost"
-    if any(token in text for token in ("中标", "已中标", "是")):
-        return "won"
+    if not text:
+        return "unknown"
+    for outcome, tokens in _OUTCOME_RULES:
+        if any(token in text for token in tokens):
+            return outcome
+    return "unknown"
+
+
+# 公式缓存值语义：xlsx_parser 对公式单元格另存 cached_value（缓存缺失时
+# 为 "unknown"，Excel 错误值为 "#REF!" 等字符串）。取有效值时：
+# 公式串本身绝不解析；缓存缺失/错误一律降级为 None，留给人工。
+_FORMULA_CACHE_UNKNOWN = "unknown"
+
+
+def _cell_effective_value(item):
+    """单元格有效值：公式单元格取缓存值；缓存缺失/错误返回 None。"""
+    value = item.get("value")
+    if isinstance(value, str) and value.startswith("="):
+        cached = item.get("cached_value")
+        if cached is None:
+            return None
+        if isinstance(cached, str):
+            text = cached.strip()
+            if not text or text == _FORMULA_CACHE_UNKNOWN:
+                return None
+            if text.startswith("#"):
+                return None  # #REF!/#VALUE!/#DIV/0! 等错误缓存
+            return text
+        return cached
     return value
+
+
+# 分节标记行（采购包/下一表等）：截断旧表头、切分报价分组；
+# 合计标记行：本身不给建议，也截断旧表头。
+_SECTION_MARK_PREFIXES = ("采购包", "标段", "分标", "包件", "包组",
+                          "下一表", "下表")
+_TOTAL_ROW_MARKS = ("合计", "总计", "小计", "汇总")
+
+
+def _is_section_mark(value):
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    return bool(text) and text.startswith(_SECTION_MARK_PREFIXES)
+
+
+def _is_total_mark(value):
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    return any(mark in text for mark in _TOTAL_ROW_MARKS)
 
 
 def _xlsx_header_suggestions(evidence: list[dict]):
     """XLSX 表头建议：明确表头标签所在列的下方非空单元格给候选。
 
     使用 P1 typed 字段（e["sheet"]/e["cell"]/e["value"]），不经 locator
-    显示字符串解析。
+    显示字符串解析。数据行只归属其上方最近的表头行：重复表头各自生效，
+    分节标记行（采购包/下一表等）与合计行截断旧表头作用域——旧表头不得
+    套到后续所有行，不同采购包不得仅凭工作表名或投标人名称互相套用。
     """
     cells = {}  # (sheet, col, row) -> (evidence_id, value)
     for e in evidence:
@@ -300,53 +377,74 @@ def _xlsx_header_suggestions(evidence: list[dict]):
     for (sheet, col, row), (eid, value) in cells.items():
         if isinstance(value, str) and value.strip() in HEADER_LABELS:
             header_rows[(sheet, row)].append((col, eid, value.strip()))
+    # 分节/合计标记行（截断点），按工作表归集
+    cut_rows = defaultdict(list)
+    for (sheet, _col, row), (_eid, value) in cells.items():
+        if _is_section_mark(value) or _is_total_mark(value):
+            cut_rows[sheet].append(row)
     suggestions = []
-    for (sheet, hrow), heads in header_rows.items():
-        if len(heads) < 2:
-            continue
-        for col, header_eid, label in heads:
-            field, unit_hint = HEADER_LABELS[label]
-            for (s, c, r), (eid, value) in sorted(
-                    cells.items(), key=lambda kv: (kv[0][0], kv[0][2])):
-                if s != sheet or c != col or r <= hrow:
-                    continue
-                if value is None or (isinstance(value, str)
-                                     and not value.strip()):
-                    continue
-                note = f"由表头「{label}」推断，待人工确认"
-                suggested_value = value
-                if field == "total_price":
-                    amount = parse_amount(value, unit_hint)
-                    suggested_value = {
-                        "raw": str(value),
-                        "number": amount["number"],
-                        "unit_hint": amount["unit"],
-                        "currency_hint": amount["currency"],
-                        "amount_yuan": amount["amount_yuan"],
-                        "status": amount["status"],
-                    }
-                    if amount["status"] == "normalized":
-                        note += f"；标准金额 {amount['amount_yuan']} 元"
-                    elif amount["status"] != "needs_unit":
-                        note += "；金额值需人工核对"
-                elif field == "outcome_result":
-                    suggested_value = _outcome_value(value)
-                sug = {"field": field, "value": suggested_value,
-                       "evidence_id": eid,
-                       "locator": {"kind": "xlsx_cell", "sheet": sheet,
-                                   "cell": f"{c}{r}"},
-                       "locator_display": f"{sheet}!{c}{r}",
-                       "note": note}
-                if field == "total_price":
-                    sug["currency_hint"] = (
-                        amount["currency"] if amount["currency"] != "unknown"
-                        else "CNY" if amount["unit"] == "yuan" else "unknown")
-                suggestions.append(sug)
+    for sheet in sorted({sheet for (sheet, _row) in header_rows}):
+        rows = sorted({row for (s, row) in header_rows if s == sheet})
+        rows = [row for row in rows if len(header_rows[(sheet, row)]) >= 2]
+        cuts = sorted(set(cut_rows.get(sheet, ())))
+        for idx, hrow in enumerate(rows):
+            next_hrow = rows[idx + 1] if idx + 1 < len(rows) else None
+            cut = next((r for r in cuts if r > hrow), None)
+            # 旧表头作用域：到下一个表头行或最近的截断行（不含）为止
+            span_end = min((x for x in (next_hrow, cut) if x is not None),
+                           default=None)
+            for col, header_eid, label in header_rows[(sheet, hrow)]:
+                field, unit_hint = HEADER_LABELS[label]
+                for (s, c, r), (eid, value) in sorted(
+                        cells.items(), key=lambda kv: (kv[0][0], kv[0][2])):
+                    if s != sheet or c != col or r <= hrow:
+                        continue
+                    if span_end is not None and r >= span_end:
+                        continue
+                    if value is None or (isinstance(value, str)
+                                         and not value.strip()):
+                        continue
+                    note = f"由表头「{label}」推断，待人工确认"
+                    suggested_value = value
+                    if field == "total_price":
+                        amount = parse_amount(value, unit_hint)
+                        suggested_value = {
+                            "raw": str(value),
+                            "number": amount["number"],
+                            "unit_hint": amount["unit"],
+                            "currency_hint": amount["currency"],
+                            "amount_yuan": amount["amount_yuan"],
+                            "status": amount["status"],
+                        }
+                        if amount["status"] == "normalized":
+                            note += f"；标准金额 {amount['amount_yuan']} 元"
+                        elif amount["status"] != "needs_unit":
+                            note += "；金额值需人工核对"
+                    elif field == "outcome_result":
+                        suggested_value = _outcome_value(value)
+                    sug = {"field": field, "value": suggested_value,
+                           "evidence_id": eid,
+                           "locator": {"kind": "xlsx_cell", "sheet": sheet,
+                                       "cell": f"{c}{r}"},
+                           "locator_display": f"{sheet}!{c}{r}",
+                           "note": note}
+                    if field == "total_price":
+                        sug["currency_hint"] = (
+                            amount["currency"] if amount["currency"] != "unknown"
+                            else "CNY" if amount["unit"] == "yuan" else "unknown")
+                    suggestions.append(sug)
     return suggestions
 
 
 def _xlsx_price_line_candidates(evidence: list[dict]) -> list[dict]:
-    """从具备主体列的明细表生成按投标人分组的整组报价候选。"""
+    """从具备主体列的明细表生成按投标人分组的整组报价候选。
+
+    公式单元格一律取缓存值（cached_value）参与解析；缓存缺失或为
+    #REF! 等错误值时该字段降级（单价 None / 文本字段留 unknown），
+    绝不把公式串本身当数值。数据行只归属其上方最近的表头行；分节
+    标记行（采购包/下一表等）与合计行截断旧表头；分组键带分节边界，
+    不同采购包即使同表同名也不合并。
+    """
     cells = {}
     for item in evidence:
         if item.get("kind") != "xlsx_cell":
@@ -355,92 +453,131 @@ def _xlsx_price_line_candidates(evidence: list[dict]) -> list[dict]:
         match = re.fullmatch(r"([A-Z]+)(\d+)", str(cell or ""))
         if not isinstance(sheet, str) or not match:
             continue
-        value = item.get("value")
-        if isinstance(value, str) and value.startswith("="):
-            value = item.get("cached_value")
         cells[(sheet, match.group(1), int(match.group(2)))] = item
 
-    headers = defaultdict(dict)
+    # 表头行：同 sheet 同 row 内 ≥2 个已知表头标签（与表头建议口径一致，
+    # 避免单个杂散标签行冒充表头截断作用域）
+    label_rows = defaultdict(dict)
     for (sheet, col, row), item in cells.items():
         value = item.get("value")
         if isinstance(value, str) and value.strip() in HEADER_LABELS:
             field, hint = HEADER_LABELS[value.strip()]
-            headers[(sheet, row)][field] = (col, item, hint)
+            label_rows[(sheet, row)][field] = (col, item, hint)
+    sheet_headers = defaultdict(list)
+    for (sheet, row), cols in label_rows.items():
+        if len(cols) >= 2:
+            sheet_headers[sheet].append((row, cols))
+    for sheet in sheet_headers:
+        sheet_headers[sheet].sort(key=lambda pair: pair[0])
+
+    # 分节/合计标记行
+    section_rows = defaultdict(list)
+    cut_rows = defaultdict(list)
+    for (sheet, col, row), item in cells.items():
+        value = item.get("value")
+        if _is_section_mark(value):
+            section_rows[sheet].append(row)
+        if _is_section_mark(value) or _is_total_mark(value):
+            cut_rows[sheet].append(row)
+    for sheet in section_rows:
+        section_rows[sheet].sort()
 
     grouped = defaultdict(list)
     group_evidence = defaultdict(set)
     group_primary = {}
-    for (sheet, header_row), cols in headers.items():
-        bidder_col = cols.get("bidder_code") or cols.get("bidder_name")
-        price_col = cols.get("unit_price")
-        if not bidder_col or not price_col:
-            continue
-        item_fields = [field for field in ("item_code", "item_name", "spec")
-                       if field in cols]
-        if not item_fields or not ("item_code" in cols
-                                   or {"item_name", "spec"} <= set(cols)):
-            continue
-        for row_no in sorted({r for s, _, r in cells
-                              if s == sheet and r > header_row}):
-            bidder_cell = cells.get((sheet, bidder_col[0], row_no))
-            price_cell = cells.get((sheet, price_col[0], row_no))
-            if not bidder_cell or not price_cell:
+    for sheet, hlist in sorted(sheet_headers.items()):
+        cuts = sorted(set(cut_rows.get(sheet, ())))
+        for idx, (header_row, cols) in enumerate(hlist):
+            bidder_col = cols.get("bidder_code") or cols.get("bidder_name")
+            price_col = cols.get("unit_price")
+            if not bidder_col or not price_col:
                 continue
-            bidder_value = bidder_cell.get("value")
-            price_value = price_cell.get("value")
-            if bidder_value in (None, "") or price_value in (None, ""):
+            item_fields = [field for field in ("item_code", "item_name", "spec")
+                           if field in cols]
+            if not item_fields or not ("item_code" in cols
+                                       or {"item_name", "spec"} <= set(cols)):
                 continue
-            parsed_price = parse_amount(price_value, price_col[2])
-            line = {"item_code": "unknown", "item_name": "unknown",
-                    "spec": "unknown", "unit": "unknown", "qty": None,
-                    "unit_price": parsed_price["amount_yuan"],
-                    "currency": "unknown", "tax_included": None,
-                    "evidence": price_cell.get("evidence_id"),
-                    "field_evidence": {"unit_price": price_cell.get("evidence_id")}}
-            for field in ("item_code", "item_name", "spec", "unit", "qty",
-                          "currency", "tax_included"):
-                if field not in cols:
+            next_hrow = hlist[idx + 1][0] if idx + 1 < len(hlist) else None
+            cut = next((r for r in cuts if r > header_row), None)
+            # 旧表头作用域：到下一个表头行或最近的截断行（不含）为止
+            span_end = min((x for x in (next_hrow, cut) if x is not None),
+                           default=None)
+            for row_no in sorted({r for s, _, r in cells
+                                  if s == sheet and r > header_row
+                                  and (span_end is None or r < span_end)}):
+                bidder_cell = cells.get((sheet, bidder_col[0], row_no))
+                price_cell = cells.get((sheet, price_col[0], row_no))
+                if not bidder_cell or not price_cell:
                     continue
-                col, _, _ = cols[field]
-                source = cells.get((sheet, col, row_no))
-                if not source or source.get("value") in (None, ""):
-                    continue
-                val = source.get("value")
-                if field == "currency" and str(val).strip() in ("人民币", "元", "CNY"):
-                    val = "CNY"
-                if field == "tax_included":
-                    normalized_tax = str(val).strip().casefold()
-                    val = (True if normalized_tax in ("是", "含税", "true", "yes")
-                           else False if normalized_tax in
-                           ("否", "不含税", "false", "no") else None)
-                line[field] = val
-                line["field_evidence"][field] = source.get("evidence_id")
-                if source.get("evidence_id"):
-                    group_evidence[(sheet, str(bidder_value).strip())].add(
-                        source["evidence_id"])
-            if parsed_price["status"] != "normalized":
-                line["unit_price"] = None
-            bidder_name = ""
-            if "bidder_name" in cols:
-                source = cells.get((sheet, cols["bidder_name"][0], row_no))
-                bidder_name = str(source.get("value") or "") if source else ""
-            bidder_key = str(bidder_value).strip()
-            group_key = (sheet, bidder_key)
-            grouped[group_key].append(line)
-            group_primary.setdefault(group_key, price_cell)
-            group_evidence[group_key].add(price_cell.get("evidence_id"))
-            group_evidence[group_key].add(bidder_cell.get("evidence_id"))
-            if bidder_name and "bidder_name" in cols:
-                source = cells.get((sheet, cols["bidder_name"][0], row_no))
-                if source:
-                    group_evidence[group_key].add(source.get("evidence_id"))
+                bidder_value = _cell_effective_value(bidder_cell)
+                if bidder_value in (None, ""):
+                    continue  # 主体未知（如公式无缓存）→ 行不归属，不猜
+                if price_cell.get("value") in (None, ""):
+                    continue  # 单价格本身为空
+                price_value = _cell_effective_value(price_cell)
+                parsed_price = parse_amount(
+                    "" if price_value is None else price_value, price_col[2])
+                line = {"item_code": "unknown", "item_name": "unknown",
+                        "spec": "unknown", "unit": "unknown", "qty": None,
+                        "unit_price": parsed_price["amount_yuan"],
+                        "currency": "unknown", "tax_included": None,
+                        "evidence": price_cell.get("evidence_id"),
+                        "field_evidence": {"unit_price": price_cell.get("evidence_id")}}
+                for field in ("item_code", "item_name", "spec", "unit", "qty",
+                              "currency", "tax_included"):
+                    if field not in cols:
+                        continue
+                    col, _, _ = cols[field]
+                    source = cells.get((sheet, col, row_no))
+                    if not source:
+                        continue
+                    val = _cell_effective_value(source)
+                    if val in (None, ""):
+                        continue  # 缓存缺失/错误 → 字段留默认，留给人工
+                    if field == "currency" and str(val).strip() in ("人民币", "元", "CNY"):
+                        val = "CNY"
+                    if field == "tax_included":
+                        normalized_tax = str(val).strip().casefold()
+                        val = (True if normalized_tax in ("是", "含税", "true", "yes")
+                               else False if normalized_tax in
+                               ("否", "不含税", "false", "no") else None)
+                    line[field] = val
+                    line["field_evidence"][field] = source.get("evidence_id")
+                    if source.get("evidence_id"):
+                        group_evidence[(sheet, str(bidder_value).strip())].add(
+                            source["evidence_id"])
+                if parsed_price["status"] != "normalized":
+                    line["unit_price"] = None
+                bidder_name = ""
+                if "bidder_name" in cols:
+                    source = cells.get((sheet, cols["bidder_name"][0], row_no))
+                    bidder_name = (str(_cell_effective_value(source) or "")
+                                   if source else "")
+                # 分组键带分节边界：不同采购包（或“下一表”分节）即使
+                # 同工作表、同投标人名称也不合并
+                section = 0
+                for boundary in section_rows.get(sheet, ()):
+                    if boundary <= row_no:
+                        section = boundary
+                    else:
+                        break
+                bidder_key = str(bidder_value).strip()
+                group_key = (sheet, section, bidder_key)
+                grouped[group_key].append(line)
+                group_primary.setdefault(group_key, price_cell)
+                group_evidence[group_key].add(price_cell.get("evidence_id"))
+                group_evidence[group_key].add(bidder_cell.get("evidence_id"))
+                if bidder_name and "bidder_name" in cols:
+                    source = cells.get((sheet, cols["bidder_name"][0], row_no))
+                    if source:
+                        group_evidence[group_key].add(source.get("evidence_id"))
 
     output = []
-    for (sheet, bidder), lines in sorted(grouped.items()):
-        ids = sorted(x for x in group_evidence[(sheet, bidder)] if x)
+    for (sheet, section, bidder), lines in sorted(grouped.items()):
+        ids = sorted(x for x in group_evidence[(sheet, section, bidder)] if x)
         if not ids:
             continue
-        primary = group_primary[(sheet, bidder)]
+        primary = group_primary[(sheet, section, bidder)]
         output.append({
             "field": "price_lines", "value": lines,
             "evidence_id": primary.get("evidence_id"), "evidence_ids": ids,
@@ -468,7 +605,7 @@ def extract_candidates(sha256: str, doc_type: str,
             if value is None:
                 continue
             if isinstance(value, str) and value.startswith("="):
-                continue  # 公式串不给候选（缓存值语义另由 P2 处理）
+                continue  # 公式串不给候选；缓存值仅用于报价行（见下）
             for field, v in _extract_pairs(str(value)):
                 candidates.append({
                     "field": field, "value": v, "evidence_id": eid,
