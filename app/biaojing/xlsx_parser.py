@@ -50,9 +50,33 @@ EXTRACTION_VERSION = (
 )
 
 # 合并区域披露上限（全局每工作簿）：触顶留痕并降为 partial，不做静默截断；
-# 单表部件超过字节上限不流式读取（防敌意超大部件撑内存），留痕并降为 partial
+# 单表部件超过字节上限不流式读取（快速跳过）；另有按"实际解压读取字节"
+# 统计的全局预算（ZipInfo.file_size 可伪造，实际计数才算数），触顶降为 partial
 _MAX_MERGED_RANGES = 1000
 _MAX_MERGE_SHEET_XML_BYTES = 64 * 1024 * 1024
+_MAX_MERGE_SCAN_TOTAL_BYTES = 128 * 1024 * 1024
+
+
+class _MergeScanBudgetExceeded(Exception):
+    """合并区域流式扫描超出全局实际读取字节预算（内部信号）。"""
+
+
+class _CountingReader:
+    """只读包装：统计实际解压读取字节数，超预算即抛出以中止扫描。"""
+
+    __slots__ = ("_stream", "_limit", "read_bytes")
+
+    def __init__(self, stream, limit: int):
+        self._stream = stream
+        self._limit = limit
+        self.read_bytes = 0
+
+    def read(self, *args):
+        chunk = self._stream.read(*args)
+        self.read_bytes += len(chunk)
+        if self.read_bytes > self._limit:
+            raise _MergeScanBudgetExceeded()
+        return chunk
 
 
 class _HeldBytesIO(io.BytesIO):
@@ -125,10 +149,11 @@ def _merged_ranges_by_sheet(data: bytes) -> tuple[dict, list[str], bool]:
     """只读解压 OOXML，从各工作表部件有界流式收集 mergeCells 合并区域。
 
     read_only 模式下 openpyxl 不暴露 merged_cells（恒为 None），这里直接
-    读工作表 XML 的 <mergeCell ref="A2:A4"/>。内存边界：iterparse 逐元素
-    读取、读毕 ref 立即 clear，绝不整份物化工作表 XML；单表部件超字节
-    上限不读取；全局每工作簿收集超条数上限即停。任何截断/不可读都置
-    incomplete=True，由调用方降为 partial 并留痕，绝不静默。
+    读工作表 XML 的 <mergeCell ref="A2:A4"/>。边界（全部触顶即 incomplete
+    → 调用方降为 partial 并留痕，绝不静默）：iterparse 逐元素读取、读毕
+    立即 clear，绝不整份物化工作表 XML；单表部件超字节上限不读取；全局
+    每工作簿收集超条数上限即停；按"实际解压读取字节"统计的全局预算触顶
+    即停（file_size 可伪造，实际计数才算数）；关系/部件缺失同样留痕。
     """
     ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
     rel_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -138,6 +163,7 @@ def _merged_ranges_by_sheet(data: bytes) -> tuple[dict, list[str], bool]:
     notes: list[str] = []
     incomplete = False
     total = 0
+    budget_used = 0
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as package:
             workbook = ET.fromstring(package.read("xl/workbook.xml"))
@@ -146,9 +172,19 @@ def _merged_ranges_by_sheet(data: bytes) -> tuple[dict, list[str], bool]:
             targets = {r.attrib["Id"]: r.attrib["Target"]
                        for r in relationships.findall(f"{{{pkg_ns}}}Relationship")}
             for sheet in workbook.findall(f"{{{ns}}}sheets/{{{ns}}}sheet"):
+                if total >= _MAX_MERGED_RANGES:
+                    incomplete = True
+                    notes.append(
+                        f"合并区域已达全局上限 {_MAX_MERGED_RANGES} 条，"
+                        "其余工作表未再读取（触顶留痕，降为 partial）")
+                    break
                 sheet_name = sheet.attrib.get("name", "")
                 target = targets.get(sheet.attrib.get(f"{{{rel_ns}}}id"))
                 if not target:
+                    incomplete = True
+                    notes.append(
+                        f"工作表 [{sheet_name}] 的关系目标缺失，"
+                        "合并区域未读取（留痕，降为 partial）")
                     continue
                 sheet_path = (posixpath.normpath(target.lstrip("/"))
                               if target.startswith("/") else
@@ -156,6 +192,10 @@ def _merged_ranges_by_sheet(data: bytes) -> tuple[dict, list[str], bool]:
                 try:
                     info = package.getinfo(sheet_path)
                 except KeyError:
+                    incomplete = True
+                    notes.append(
+                        f"工作表 [{sheet_name}] 的部件 {sheet_path} 缺失，"
+                        "合并区域未读取（留痕，降为 partial）")
                     continue
                 if info.file_size > _MAX_MERGE_SHEET_XML_BYTES:
                     incomplete = True
@@ -166,9 +206,14 @@ def _merged_ranges_by_sheet(data: bytes) -> tuple[dict, list[str], bool]:
                     continue
                 collected: list[str] = []
                 hit_cap = False
+                stop_scan = False
+                reader = None
                 try:
                     with package.open(sheet_path) as stream:
-                        for _event, elem in ET.iterparse(stream,
+                        reader = _CountingReader(
+                            stream,
+                            _MAX_MERGE_SCAN_TOTAL_BYTES - budget_used)
+                        for _event, elem in ET.iterparse(reader,
                                                          events=("end",)):
                             if elem.tag == merge_tag:
                                 ref = elem.attrib.get("ref", "")
@@ -179,11 +224,20 @@ def _merged_ranges_by_sheet(data: bytes) -> tuple[dict, list[str], bool]:
                                     collected.append(ref)
                                     total += 1
                             elem.clear()
+                except _MergeScanBudgetExceeded:
+                    incomplete = True
+                    stop_scan = True
+                    notes.append(
+                        "合并区域流式扫描超出全局实际读取字节预算 "
+                        f"{_MAX_MERGE_SCAN_TOTAL_BYTES} 字节"
+                        "（触顶留痕，降为 partial）")
                 except (OSError, ET.ParseError) as exc:
                     incomplete = True
                     notes.append(
                         f"工作表 [{sheet_name}] 合并区域读取不完整："
                         f"{type(exc).__name__}: {exc}")
+                if reader is not None and not stop_scan:
+                    budget_used += reader.read_bytes
                 if hit_cap:
                     incomplete = True
                     notes.append(
@@ -192,6 +246,8 @@ def _merged_ranges_by_sheet(data: bytes) -> tuple[dict, list[str], bool]:
                         "（触顶留痕，降为 partial）")
                 if collected:
                     merges[sheet_name] = collected
+                if stop_scan:
+                    break
     except (OSError, KeyError, ValueError, ET.ParseError, zipfile.BadZipFile) as exc:
         incomplete = True
         notes.append(f"Excel 合并区域读取不完整：{type(exc).__name__}: {exc}")

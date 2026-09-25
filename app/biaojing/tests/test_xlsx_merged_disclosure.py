@@ -137,6 +137,54 @@ class XlsxMergedDisclosureTests(unittest.TestCase):
         self.assertTrue(any("不完整" in n for n in notes),
                         f"损坏部件未留痕：{notes}")
 
+    def test_workbook_bytes_budget_marks_partial(self):
+        # 全局"实际解压读取字节"预算：file_size 可伪造，实际计数才算数；
+        # 触顶留痕并降为 partial（预算调小以便测试）
+        import unittest.mock
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "大表"
+        for r in range(1, 200):
+            ws.append([f"值{r}"] * 8)
+        buf = io.BytesIO()
+        wb.save(buf)
+        with unittest.mock.patch.object(xlsx_parser,
+                                        "_MAX_MERGE_SCAN_TOTAL_BYTES", 256):
+            merges, notes, incomplete = xlsx_parser._merged_ranges_by_sheet(
+                buf.getvalue())
+        self.assertFalse(merges)
+        self.assertTrue(incomplete)
+        self.assertTrue(any("字节预算" in n for n in notes),
+                        f"字节预算触顶未留痕：{notes}")
+        with unittest.mock.patch.object(xlsx_parser,
+                                        "_MAX_MERGE_SCAN_TOTAL_BYTES", 256):
+            rec = xlsx_parser.parse(buf.getvalue())
+        self.assertEqual(rec["status"], "partial")
+        self.assertTrue(rec["counts"]["merged_ranges_incomplete"])
+
+    def test_missing_sheet_relationship_marks_incomplete(self):
+        # workbook.xml 引用的关系缺失：不得静默跳过，置 incomplete 并留痕
+        import zipfile as _zipfile
+        good = _wb_with_merges(["A2:A3"])
+        src = {}
+        with _zipfile.ZipFile(io.BytesIO(good)) as z:
+            for name in z.namelist():
+                src[name] = z.read(name)
+        src["xl/_rels/workbook.xml.rels"] = (
+            '<?xml version="1.0"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/'
+            'package/2006/relationships"/>').encode("utf-8")
+        buf = io.BytesIO()
+        with _zipfile.ZipFile(buf, "w") as z:
+            for name, payload in src.items():
+                z.writestr(name, payload)
+        merges, notes, incomplete = xlsx_parser._merged_ranges_by_sheet(
+            buf.getvalue())
+        self.assertFalse(merges)
+        self.assertTrue(incomplete)
+        self.assertTrue(any("关系" in n or "缺失" in n for n in notes),
+                        f"关系缺失未留痕：{notes}")
+
 
 if __name__ == "__main__":
     unittest.main()
