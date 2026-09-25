@@ -508,8 +508,9 @@ def _xlsx_header_suggestions(evidence: list[dict]):
         if not isinstance(sheet, str) or not sheet or not isinstance(cell, str):
             continue
         value = e.get("value")
-        if isinstance(value, str) and value.startswith("="):
-            continue  # 公式串不作建议
+        # 公式单元格在此**注册不排除**：仅含公式的行也要计入非空行集合，
+        # 否则会被全空分隔行截断逻辑误判、静默截断表头作用域（F 线声明
+        # 的建议路径公式行限制）；公式串在下方产出建议时才跳过
         m = re.match(r"([A-Z]+)(\d+)", cell)
         if not m:
             continue
@@ -579,6 +580,8 @@ def _xlsx_header_suggestions(evidence: list[dict]):
                     if value is None or (isinstance(value, str)
                                          and not value.strip()):
                         continue
+                    if isinstance(value, str) and value.startswith("="):
+                        continue  # 公式串不作建议（缓存值语义见 price_lines）
                     note = f"由表头「{label}」推断，待人工确认"
                     suggested_value = value
                     if field == "total_price":
