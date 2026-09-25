@@ -314,12 +314,25 @@ def _outcome_value(value):
     text = str(value).strip().casefold()
     if not text:
         return "unknown"
-    if any(token in text for token in _OUTCOME_REJECTED_TOKENS):
-        return "rejected"
-    if any(token in text for token in _OUTCOME_INVALID_TOKENS):
-        return "invalid"
     negated = any(cue in text for cue in _OUTCOME_NEGATION_CUES)
     questioned = any(cue in text for cue in _OUTCOME_QUESTION_CUES)
+    # 否决/无效分支同样受否向与疑问守卫约束（复核四轮）：先剥离命中的
+    # 状态词再判守卫——「无效」本身含否向字「无」，不剥离会自伤；
+    # 「未被否决」「是否被否决？」「并非无效」一律 unknown，不猜
+    rejected_hit = next((t for t in _OUTCOME_REJECTED_TOKENS if t in text),
+                        None)
+    if rejected_hit is not None:
+        without = text.replace(rejected_hit, "")
+        if any(cue in without for cue in _OUTCOME_NEGATION_CUES) or \
+                any(cue in without for cue in _OUTCOME_QUESTION_CUES):
+            return "unknown"
+        return "rejected"
+    if "无效" in text:
+        without = text.replace("无效", "")
+        if any(cue in without for cue in _OUTCOME_NEGATION_CUES) or \
+                any(cue in without for cue in _OUTCOME_QUESTION_CUES):
+            return "unknown"
+        return "invalid"
     if any(token in text for token in _OUTCOME_CANDIDATE_TOKENS):
         if negated or questioned:
             return "unknown"  # 候选标记 + 否向/疑问并存 → 正反信号冲突，不猜
@@ -592,6 +605,21 @@ def _xlsx_header_suggestions(evidence: list[dict]):
     return suggestions
 
 
+def _col_index(letters: str) -> int:
+    n = 0
+    for ch in letters:
+        n = n * 26 + (ord(ch) - 64)
+    return n
+
+
+def _col_letter(index: int) -> str:
+    out = ""
+    while index:
+        index, rem = divmod(index - 1, 26)
+        out = chr(65 + rem) + out
+    return out
+
+
 def _xlsx_price_line_candidates(evidence: list[dict]) -> list[dict]:
     """从具备主体列的明细表生成按投标人分组的整组报价候选。
 
@@ -615,18 +643,72 @@ def _xlsx_price_line_candidates(evidence: list[dict]) -> list[dict]:
             continue
         cells[(sheet, match.group(1), int(match.group(2)))] = item
 
+    # 合并区域索引（P2-8 下半）：解析层已逐区域披露 xlsx_merged_range，
+    # 此处换算成 (列起, 列止, 行起, 行止)，供纵向主体锚点回填与
+    # 横向合并表头覆盖列识别；旧解析输出无该证据时行为与原先一致
+    merge_spans = defaultdict(list)
+    for item in evidence:
+        if item.get("kind") != "xlsx_merged_range":
+            continue
+        sheet = item.get("sheet")
+        m = re.fullmatch(r"([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?",
+                         str(item.get("range") or ""))
+        if not isinstance(sheet, str) or not m:
+            continue
+        c1, r1 = _col_index(m.group(1)), int(m.group(2))
+        c2 = _col_index(m.group(3)) if m.group(3) else c1
+        r2 = int(m.group(4)) if m.group(4) else r1
+        merge_spans[sheet].append((min(c1, c2), max(c1, c2),
+                                   min(r1, r2), max(r1, r2)))
+
     # 表头行字段映射：同字段多列全部记入 dup_label_cols（含首列，按列序），
-    # label_rows 只存首列（F 线缺口 4：原实现后者覆盖前者，静默取末列）
+    # label_rows 只存首列（F 线缺口 4：原实现后者覆盖前者，静默取末列）；
+    # 合并表头覆盖列以锚点标签识别字段，交给同字段多列的保守策略接管
     label_rows = defaultdict(dict)
     dup_label_cols = defaultdict(lambda: defaultdict(list))
     for (sheet, col, row), item in cells.items():
         value = item.get("value")
-        if isinstance(value, str) and value.strip() in HEADER_LABELS:
-            field, hint = HEADER_LABELS[value.strip()]
+        label = value.strip() if isinstance(value, str) else None
+        if not label:
+            col_idx = _col_index(col)
+            for (c1, c2, r1, r2) in merge_spans.get(sheet, ()):
+                if c1 <= col_idx <= c2 and r1 <= row <= r2 \
+                        and not (col_idx == c1 and row == r1):
+                    anchor_cell = cells.get((sheet, _col_letter(c1), r1))
+                    anchor_value = (anchor_cell.get("value")
+                                    if anchor_cell else None)
+                    label = (anchor_value.strip()
+                             if isinstance(anchor_value, str) else None)
+                    break
+        if label and label in HEADER_LABELS:
+            field, hint = HEADER_LABELS[label]
             row_fields = label_rows[(sheet, row)]
             dup_label_cols[(sheet, row)][field].append(col)
             if field not in row_fields:
                 row_fields[field] = (col, item, hint)
+
+    # 合并表头覆盖列补注册（P2-8 下半）：被覆盖的空单元格不产证据，
+    # 上面的逐格循环看不到它们——按锚点标签为覆盖列补记同字段；
+    # 由此形成的同字段多列交给既有重复字段保守策略（unit_price
+    # 不自动取值并披露，文本取第一列），绝不自动选列
+    for sheet, spans in merge_spans.items():
+        for (c1, c2, r1, r2) in spans:
+            if r1 != r2 or c1 == c2:
+                continue  # 只处理单行横向合并表头
+            anchor_cell = cells.get((sheet, _col_letter(c1), r1))
+            anchor_value = (anchor_cell.get("value") if anchor_cell else None)
+            label = (anchor_value.strip()
+                     if isinstance(anchor_value, str) else None)
+            if label not in HEADER_LABELS:
+                continue
+            field, hint = HEADER_LABELS[label]
+            row_fields = label_rows[(sheet, r1)]
+            known = dup_label_cols[(sheet, r1)][field]
+            for col_idx in range(c1, c2 + 1):
+                col = _col_letter(col_idx)
+                if col not in known:
+                    known.append(col)
+                row_fields.setdefault(field, (col, anchor_cell, hint))
 
     # 非空行集合（整行全空分隔行截断作用域）、行值（合并护栏）、
     # 分节/合计标记行
@@ -733,7 +815,24 @@ def _xlsx_price_line_candidates(evidence: list[dict]) -> list[dict]:
                     continue  # 无单价单元格或单价格本身为空
                 bidder_value = (_cell_effective_value(bidder_cell)
                                 if bidder_cell else None)
+                merged_bidder = None
                 if not bidder_cell or bidder_value in (None, ""):
+                    # 主体缺失先试合并区域锚点回填（P2-8 下半）：纵向合并
+                    # 的投标人列以锚点值归属，缺行不再静默看似完整；
+                    # 锚点也为空（公式无缓存等）→ 维持不归属，不猜
+                    bidder_idx = _col_index(bidder_col[0])
+                    for (c1, c2, r1, r2) in merge_spans.get(sheet, ()):
+                        if c1 <= bidder_idx <= c2 and r1 <= row_no <= r2:
+                            anchor_cell = cells.get(
+                                (sheet, _col_letter(c1), r1))
+                            anchor_value = (_cell_effective_value(anchor_cell)
+                                            if anchor_cell else None)
+                            if anchor_value not in (None, ""):
+                                bidder_value = anchor_value
+                                merged_bidder = (anchor_cell, c1, r1)
+                            break
+                if merged_bidder is None and (not bidder_cell
+                                              or bidder_value in (None, "")):
                     # 主体缺失（公式无缓存/疑似合并单元格缺行）：行不归属，
                     # 但有单价的行计数披露，绝不静默丢弃
                     if price_cell is not None:
@@ -786,13 +885,26 @@ def _xlsx_price_line_candidates(evidence: list[dict]) -> list[dict]:
                 bidder_name = ""
                 if "bidder_name" in cols:
                     source = cells.get((sheet, cols["bidder_name"][0], row_no))
+                    if source is None and merged_bidder is not None:
+                        source = merged_bidder[0]
                     bidder_name = (str(_cell_effective_value(source) or "")
                                    if source else "")
                 grouped[group_key].append(line)
                 group_primary.setdefault(group_key, price_cell or bidder_cell)
                 if price_cell is not None:
                     group_evidence[group_key].add(price_cell.get("evidence_id"))
-                group_evidence[group_key].add(bidder_cell.get("evidence_id"))
+                if merged_bidder is not None:
+                    anchor_cell, anchor_col_idx, anchor_row = merged_bidder
+                    if anchor_cell is not None \
+                            and anchor_cell.get("evidence_id"):
+                        group_evidence[group_key].add(
+                            anchor_cell["evidence_id"])
+                    group_notes[group_key].add(
+                        "投标人来自合并区域锚点 "
+                        f"{_col_letter(anchor_col_idx)}{anchor_row}，"
+                        "归属经回填，须人工核对")
+                elif bidder_cell is not None:
+                    group_evidence[group_key].add(bidder_cell.get("evidence_id"))
                 if bidder_name and "bidder_name" in cols:
                     source = cells.get((sheet, cols["bidder_name"][0], row_no))
                     if source:

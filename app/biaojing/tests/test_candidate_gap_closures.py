@@ -373,5 +373,36 @@ class BlankRowScopeTests(unittest.TestCase):
         self.assertEqual(prices, [100, 200])
 
 
+class OutcomeNegatedPolarityTests(unittest.TestCase):
+    """复核四轮补充：否决/无效分支同样受否向与疑问守卫约束。
+
+    否定的「否决/无效」与对它们的提问一律 unknown——rejected/invalid
+    只能由无否向、无疑问的明确表述产生；显性落标词（未中标/落标/未获得）
+    的既有映射不受影响。
+    """
+
+    def test_negated_rejected_is_unknown(self):
+        for text in ("未被否决", "没否决", "并非否决", "不是否决"):
+            self.assertEqual(candidates._outcome_value(text), "unknown", text)
+
+    def test_question_about_rejection_is_unknown(self):
+        for text in ("是否被否决？", "是否否决", "被否决吗", "能否否决"):
+            self.assertEqual(candidates._outcome_value(text), "unknown", text)
+
+    def test_negated_invalid_is_unknown(self):
+        for text in ("并非无效", "不是无效", "未无效", "无无效"):
+            self.assertEqual(candidates._outcome_value(text), "unknown", text)
+
+    def test_clear_rejected_and_invalid_unchanged(self):
+        for text in ("否决", "被否决", "废标", "否决投标"):
+            self.assertEqual(candidates._outcome_value(text), "rejected", text)
+        self.assertEqual(candidates._outcome_value("无效"), "invalid")
+        self.assertEqual(candidates._outcome_value("无效投标"), "invalid")
+
+    def test_lexicalized_lost_terms_keep_mapping(self):
+        for text in ("未中标", "未中", "落标", "未获得"):
+            self.assertEqual(candidates._outcome_value(text), "lost", text)
+
+
 if __name__ == "__main__":
     unittest.main()
