@@ -36,8 +36,9 @@
 
 from __future__ import annotations
 
+import re
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, localcontext
 
 from .money import decimal_text
@@ -888,11 +889,18 @@ def screen_r005(fb: FactBase, thresholds: dict) -> list[dict]:
 
 # ---------------------------------------------------------------- R006
 
+_PDF_DATE_RE = re.compile(
+    r"^(?:D:)?(\d{4})(\d{2})?(\d{2})?(\d{2})?(\d{2})?(\d{2})?"
+    r"(?:([Zz+\-])(\d{2})?(?:'?(\d{2})?'?)?)?$")
+
+
 def _parse_creation(ts):
     """解析文档内创建时间：返回 (datetime, 时区标注, 是否含时间部分) 或 None。
 
     aware 一律规范化到 UTC 再比较；naive 保持原值，且不得与 aware 跨类比较。
-    仅接受 ISO 8601 风格（含常见空格分隔）；解析失败返回 None，绝不猜。
+    接受 ISO 8601 与 PDF 日期（D:YYYYMMDDHHmmSS[+HH'mm'|Z]，D: 前缀可省），
+    原始文本与时区由调用方另行保留；月份/日期越界或解析不了一律返回 None，
+    绝不猜。兼容 Python 3.10（不用 fromisoformat 的 Z/宽松语法）。
     """
     if not isinstance(ts, str):
         return None
@@ -903,7 +911,27 @@ def _parse_creation(ts):
     try:
         dt = datetime.fromisoformat(candidate)
     except ValueError:
-        return None
+        m = _PDF_DATE_RE.match(raw)
+        if not m:
+            return None
+        year, mon, day, hh, mm, ss, tzmark, off_h, off_m = m.groups()
+        try:
+            tz = None
+            if tzmark and tzmark in "+-":
+                delta = timedelta(hours=int(off_h or 0), minutes=int(off_m or 0))
+                if tzmark == "-":
+                    delta = -delta
+                tz = timezone(delta)
+            elif tzmark:
+                tz = timezone.utc
+            dt = datetime(int(year), int(mon or 1), int(day or 1),
+                          int(hh or 0), int(mm or 0), int(ss or 0), tzinfo=tz)
+        except ValueError:
+            return None
+        tz_label = str(tz) if tz is not None else "未标注时区(naive)"
+        if tz is not None:
+            dt = dt.astimezone(timezone.utc)
+        return dt, tz_label, bool(hh or mm or ss)
     has_time = len(raw) > 10 or (dt.hour or dt.minute or dt.second) != 0
     if dt.tzinfo is not None:
         tz_label = str(dt.tzinfo) or "UTC"
@@ -1011,45 +1039,20 @@ def screen_r006(fb: FactBase, thresholds: dict) -> list[dict]:
     # ---- 时间聚集子分析（相近但不完全相同 / 同日）----
     if len(timed) < 2:
         return findings
-    parent = list(range(len(timed)))
-
-    def find(i):
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
-
-    def union(i, j):
-        ri, rj = find(i), find(j)
-        if ri != rj:
-            parent[rj] = ri
-
-    for i in range(len(timed)):
-        dt_i, _, has_i, _, _ = timed[i]
-        for j in range(i + 1, len(timed)):
-            dt_j, _, has_j, _, _ = timed[j]
-            # naive 与 aware 不得跨类比较；无时间部分不得判秒级相近
-            if (dt_i.tzinfo is None) != (dt_j.tzinfo is None):
-                continue
-            if not (has_i and has_j):
-                continue
-            if abs((dt_i - dt_j).total_seconds()) <= window:
-                union(i, j)
-    groups = defaultdict(list)
-    for i in range(len(timed)):
-        groups[find(i)].append(i)
     tight_sets: list[frozenset] = []
-    for members in groups.values():
-        if len(members) < 2:
-            continue
-        entries = [timed[i] for i in members]
-        bidders = sorted({b.bidder_id for _, _, _, b, _ in entries})
+
+    def emit_tight(segment):
+        if len(segment) < 2:
+            return
+        bidders = sorted({b.bidder_id for _, _, _, b, _ in segment})
         if len(bidders) < 2:
-            continue
-        key_set = frozenset((b.bidder_id, f.file_ref) for _, _, _, b, f in entries)
+            return
+        key_set = frozenset((b.bidder_id, f.file_ref)
+                            for _, _, _, b, f in segment)
         if any(key_set <= s for s in exact_sets):
-            continue  # 已被完全相等分组覆盖，不重复上报
+            return  # 已被完全相等分组覆盖，不重复上报
         tight_sets.append(key_set)
+        entries = segment
         dts = [dt for dt, _, _, _, _ in entries]
         span = int((max(dts) - min(dts)).total_seconds())
         findings.append(make_finding(
@@ -1086,6 +1089,27 @@ def screen_r006(fb: FactBase, thresholds: dict) -> list[dict]:
             alternatives=list(_R006_CLUSTER_ALTERNATIVES),
             signal="待核信号",
         ))
+
+    # 相近窗口要求"整簇跨度"都在窗口内：按类（naive/aware）分组排序后做
+    # 跨度受限的贪心切分；链式相邻相近（A≈B、B≈C）不等于整簇相近，
+    # 跨度超窗的成员只落同日弱信号
+    for aware_class in (False, True):
+        chain = sorted(
+            (e for e in timed
+             if e[2] and (e[0].tzinfo is not None) == aware_class),
+            key=lambda e: e[0])
+        segment: list = []
+        seg_start = None
+        for e in chain:
+            if seg_start is None or (e[0] - seg_start).total_seconds() <= window:
+                segment.append(e)
+                if seg_start is None:
+                    seg_start = e[0]
+            else:
+                emit_tight(segment)
+                segment, seg_start = [e], e[0]
+        emit_tight(segment)
+
     # 同日聚集：同规范化日期且同类（aware/naive），不受相近窗口约束
     day_groups = defaultdict(list)
     for dt, tz_label, has_time, b, f in timed:

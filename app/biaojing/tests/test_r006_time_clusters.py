@@ -239,3 +239,75 @@ class R006TimeClusterTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class R006PdfDateAndSpanTests(unittest.TestCase):
+    """独立复核补充：PDF 日期格式与窗口跨度口径。"""
+
+    def test_pdf_date_format_nearby_times_cluster(self):
+        # 真实 PDF 解析器暴露 D:YYYYMMDDHHmmSS+HH'mm' 格式，必须可解析
+        out = cluster_result([
+            {"metadata": {"producer": "软件甲",
+                          "creation_date": "D:20260301090000+08'00'"}},
+            {"metadata": {"producer": "软件乙",
+                          "creation_date": "D:20260301090110+08'00'"}},
+        ])
+        fs = by_rule(out, "R006")
+        self.assertEqual(len(fs), 1)
+        f = fs[0]
+        self.assertEqual(f["params"]["cluster_mode"], "tight_window")
+        self.assertIn("70", f["trigger_reason"])
+        files = {x["file_ref"]: x for x in f["inputs"]["files"]}
+        # 原始文本逐字保留；时区标注保留 +08:00；规范化时间为 UTC
+        self.assertEqual(files["b1.pdf"]["creation_date"],
+                         "D:20260301090000+08'00'")
+        self.assertIn("+08", files["b1.pdf"]["timezone"])
+        self.assertTrue(files["b1.pdf"]["normalized_time"]
+                        .startswith("2026-03-01T01:00:00"))
+
+    def test_pdf_date_z_and_offset_compared_in_utc(self):
+        out = cluster_result([
+            {"metadata": {"producer": "软件甲",
+                          "creation_date": "D:20260301010000Z"}},
+            {"metadata": {"producer": "软件乙",
+                          "creation_date": "D:20260301090110+08'00'"}},
+        ])
+        fs = by_rule(out, "R006")
+        # Z = UTC 01:00:00；+08'00' = UTC 01:01:10 → 相差 70 秒
+        self.assertEqual(len(fs), 1)
+        self.assertEqual(fs[0]["params"]["cluster_mode"], "tight_window")
+        self.assertIn("70", fs[0]["trigger_reason"])
+
+    def test_pdf_date_only_same_day_no_seconds_claim(self):
+        out = cluster_result([
+            {"metadata": {"producer": "软件甲",
+                          "creation_date": "D:20260301"}},
+            {"metadata": {"producer": "软件乙",
+                          "creation_date": "D:20260301"}},
+        ])
+        fs = by_rule(out, "R006")
+        self.assertEqual(len(fs), 1)
+        self.assertEqual(fs[0]["params"]["cluster_mode"], "same_day")
+        self.assertNotIn("秒", fs[0]["trigger_reason"])
+
+    def test_chained_cluster_span_must_fit_window(self):
+        # 链式相邻（110s+110s）不等于整簇相近：全簇跨度 220s 不得声称
+        # 处于 120 秒窗口；切分后前两台 tight，第三台只进同日弱信号
+        out = cluster_result([
+            {"metadata": {"producer": "软件甲",
+                          "creation_date": "2026-03-01T09:00:00"}},
+            {"metadata": {"producer": "软件乙",
+                          "creation_date": "2026-03-01T09:01:50"}},
+            {"metadata": {"producer": "软件丙",
+                          "creation_date": "2026-03-01T09:03:40"}},
+        ])
+        fs = by_rule(out, "R006")
+        tights = [f for f in fs if f["params"]["cluster_mode"] == "tight_window"]
+        self.assertEqual(len(tights), 1)
+        self.assertEqual(sorted(tights[0]["scope"]["bidder_ids"]), ["B1", "B2"])
+        self.assertIn("110", tights[0]["trigger_reason"])
+        self.assertNotIn("220", tights[0]["trigger_reason"])
+        sames = [f for f in fs if f["params"]["cluster_mode"] == "same_day"]
+        self.assertEqual(len(sames), 1)
+        self.assertEqual(sorted(sames[0]["scope"]["bidder_ids"]),
+                         ["B1", "B2", "B3"])
