@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 Set-Location -LiteralPath $PSScriptRoot
 $venvPython = Join-Path (Join-Path $PSScriptRoot ".venv") "Scripts/python.exe"
 if (-not (Test-Path -LiteralPath $venvPython)) {
