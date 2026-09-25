@@ -182,6 +182,35 @@ class PdfTests(unittest.TestCase):
         self.assertEqual(result["evidence"][0]["page_status"], "pending_ocr")
         self.assertEqual(result["evidence"][0]["page"], 1)
 
+    def test_mixed_text_and_scanned_image_page_runs_ocr(self):
+        doc = pymupdf.open()
+        page = doc.new_page(width=360, height=180)
+        pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 60, 60), 0)
+        page.insert_image(page.rect, pixmap=pix)
+        page.insert_text((20, 28), "表头", fontsize=12, fontname="china-s")
+        data = doc.tobytes()
+        doc.close()
+        from biaojing import pdf_parser
+
+        with patch.object(pdf_parser, "_ocr_runtime",
+                          return_value=("tesseract", "chi_sim+eng", None)), \
+                patch.object(pdf_parser, "_ocr_page",
+                             return_value=("扫描内容", None)) as ocr:
+            result = pdf_parser.parse(data)
+        self.assertEqual(ocr.call_count, 1)
+        self.assertEqual(result["evidence"][0]["page_status"], "ocr")
+        self.assertIn("表头", result["evidence"][0]["text"])
+        self.assertIn("扫描内容", result["evidence"][0]["text"])
+        self.assertIn("混合页面", result["evidence"][0]["page_note"])
+        self.assertEqual(result["counts"]["pages_pending_ocr"], 0)
+
+        with patch.object(pdf_parser, "_ocr_runtime",
+                          return_value=(None, None, "缺少 Tesseract")):
+            pending = pdf_parser.parse(data)
+        self.assertEqual(pending["evidence"][0]["page_status"], "pending_ocr")
+        self.assertEqual(pending["evidence"][0]["text"], "表头")
+        self.assertIn("混合页面", pending["evidence"][0]["page_error"])
+
     def test_all_scan_pages_pending_ocr(self):
         path = _tmp("allscan.pdf")
         make_scan_pdf(path, ["", ""], image_pages={1, 2})

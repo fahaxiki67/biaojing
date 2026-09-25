@@ -17,7 +17,13 @@ def bundle(version: str, filename: str = "module.py", value: str = "new") -> byt
     with zipfile.ZipFile(data, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("app/biaojing/__init__.py",
                          f'PRODUCT_NAME = "标镜"\nVERSION = "{version}"\n')
-        archive.writestr(f"app/biaojing/{filename}", value)
+        files = {f"app/biaojing/{module}.py": "# test module\n"
+                 for module in ("pdf_parser", "docx_parser", "xlsx_parser",
+                                "money", "candidates", "rules", "workspace",
+                                "webapp", "cli", "updater")}
+        files[f"app/biaojing/{filename}"] = value
+        for path, content in files.items():
+            archive.writestr(path, content)
     return data.getvalue()
 
 
@@ -32,8 +38,8 @@ class UpdaterTests(unittest.TestCase):
             "status": "unconfigured", "current_version": updater.VERSION})
 
     def test_github_release_asset_is_digest_verified_and_staged(self):
-        archive = bundle("0.2.0")
-        tag = "v0.2.0"
+        archive = bundle("0.2.1")
+        tag = "v0.2.1"
         api_payload = json.dumps({
             "tag_name": tag,
             "assets": [{
@@ -80,11 +86,28 @@ class UpdaterTests(unittest.TestCase):
             workspace.mkdir()
             (workspace / "source.pdf").write_bytes(b"keep")
 
-            updater._stage(root, bundle("0.2.0"), "v0.2.0")
-            self.assertEqual(updater.apply_pending_update(root), "v0.2.0")
+            updater._stage(root, bundle("0.2.1"), "v0.2.1")
+            self.assertEqual(updater.apply_pending_update(root), "v0.2.1")
             self.assertTrue((package / "module.py").is_file())
             self.assertFalse((package / "old.py").exists())
             self.assertEqual((workspace / "source.pdf").read_bytes(), b"keep")
+
+    def test_import_check_failure_rolls_back_and_remembers_bad_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "app" / "biaojing"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text('VERSION = "0.1.0"\n')
+            (package / "old.py").write_text("old")
+            updater._stage(root, bundle("0.2.1", "rules.py", "def broken(:\n"),
+                            "v0.2.1")
+            with self.assertRaises(updater.UpdateError):
+                updater.apply_pending_update(root)
+            self.assertEqual((package / "__init__.py").read_text(),
+                             'VERSION = "0.1.0"\n')
+            self.assertTrue((package / "old.py").is_file())
+            self.assertEqual(updater._rejected_update(root)["version"], "v0.2.1")
+            self.assertFalse((root / ".biaojing-update-staging").exists())
 
     def test_bundle_rejects_path_traversal_without_touching_current_code(self):
         with tempfile.TemporaryDirectory() as directory:

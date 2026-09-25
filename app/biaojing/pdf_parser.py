@@ -35,6 +35,8 @@ OCR_MAX_PIXELS = 25_000_000
 OCR_MAX_IMAGE_BYTES = 25_000_000
 OCR_PAGE_TIMEOUT = 15
 OCR_SPARSE_MIN_CHARS = 20
+MIXED_PAGE_MIN_TEXT_CHARS = 80
+MIXED_PAGE_IMAGE_COVERAGE = 0.25
 EXTRACTION_VERSION = (f"{PARSER_NAME}; OCR dpi={OCR_DPI}, psm=3+11, "
                       f"min={OCR_SPARSE_MIN_CHARS}, timeout={OCR_PAGE_TIMEOUT}s, profile=v1")
 
@@ -180,6 +182,24 @@ def page_count(data: bytes) -> int | None:
         return None
 
 
+def _image_coverage(page, images) -> float:
+    """估算页面图片覆盖比例，用于发现“页码原生文字 + 扫描整页图”。"""
+    page_area = max(0.0, page.rect.width * page.rect.height)
+    if not page_area:
+        return 0.0
+    area = 0.0
+    for image in images:
+        try:
+            rects = page.get_image_rects(image[0])
+        except Exception:
+            continue
+        for rect in rects:
+            clipped = rect & page.rect
+            if not clipped.is_empty:
+                area += max(0.0, clipped.width * clipped.height)
+    return min(1.0, area / page_area)
+
+
 def parse(data: bytes, ocr_pages: set[int] | None = None,
           progress=None, cancelled=None) -> dict:
     """返回 {ok, status, evidence, counts, metadata, notes, error}。"""
@@ -243,20 +263,28 @@ def parse(data: bytes, ocr_pages: set[int] | None = None,
                 notes.append(f"第 {i} 页文本读取失败（{type(exc).__name__}），尝试 OCR")
             has_text = bool(text and text.strip())
             try:
-                has_images = bool(page.get_images(full=True))
+                images = page.get_images(full=True)
+                has_images = bool(images)
             except Exception:
+                images = []
                 has_images = False
                 page_read_failed = True
                 page_error = page_error or "图像检测失败"
                 notes.append(f"第 {i} 页图像检测失败，尝试 OCR，不按空白页处理")
             ocr_used = False
-            if has_text:
+            image_coverage = _image_coverage(page, images) if has_images else 0.0
+            mixed_page = (has_text and len(text.strip()) < MIXED_PAGE_MIN_TEXT_CHARS
+                          and image_coverage >= MIXED_PAGE_IMAGE_COVERAGE)
+            native_text = text.strip()
+            if has_text and not mixed_page:
                 page_status = "text"
                 pages_text += 1
-            elif has_images or page_read_failed:
+            elif has_images or page_read_failed or mixed_page:
                 if ocr_pages is not None and i not in ocr_pages:
                     page_status = "pending_ocr"
-                    page_error = page_error or "本次未重试此页"
+                    page_error = page_error or (
+                        "页面含大幅扫描图且原生文字较少，需 OCR 复核；本次未重试此页"
+                        if mixed_page else "本次未重试此页")
                 else:
                     if not ocr_checked:
                         ocr_binary, ocr_lang, unavailable = _ocr_runtime()
@@ -264,12 +292,17 @@ def parse(data: bytes, ocr_pages: set[int] | None = None,
                         if unavailable:
                             notes.append(unavailable)
                     if ocr_binary and ocr_lang:
-                        text, ocr_error = _ocr_page(
+                        ocr_text, ocr_error = _ocr_page(
                             page, ocr_binary, ocr_lang, OCR_PAGE_TIMEOUT)
-                        if text:
+                        if ocr_text:
                             page_status = "ocr"
                             ocr_used = True
                             pages_ocr += 1
+                            text = (native_text + "\n" + ocr_text).strip() \
+                                if native_text else ocr_text
+                            if mixed_page:
+                                page_note = "混合页面：已合并原生文字和扫描图 OCR；请对照原页核验"
+                                notes.append(f"第 {i} 页{page_note}")
                             if ocr_error:
                                 page_note = ocr_error
                                 notes.append(f"第 {i} 页 {ocr_error}")
@@ -278,12 +311,18 @@ def parse(data: bytes, ocr_pages: set[int] | None = None,
                                 ocr_note_added = True
                         else:
                             page_status = "pending_ocr"
-                            page_error = ocr_error or page_error
+                            page_error = ocr_error or page_error or (
+                                "混合页面扫描图未能 OCR；已保留原生文字，页面仍待人工复核"
+                                if mixed_page else None)
+                            text = native_text
                             if ocr_error:
                                 notes.append(f"第 {i} 页 {ocr_error}，仍待 OCR")
                     else:
                         page_status = "pending_ocr"
                         page_error = unavailable or page_error
+                        if mixed_page:
+                            page_error = (page_error or "") + "；混合页面原生文字不完整，需复核"
+                            text = native_text
                 if page_status == "pending_ocr" and page_error is None:
                     page_error = "扫描页仍待 OCR"
                 if page_status == "pending_ocr":

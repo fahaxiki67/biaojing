@@ -252,8 +252,16 @@ class Handler(BaseHTTPRequestHandler):
         if self.path in ("/", "/index.html"):
             self._send_html(INDEX_HTML)
             return
-        if self.path == "/api/state":
-            self._send_json(wb.state())
+        from urllib.parse import parse_qs, urlparse
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/state":
+            qs = parse_qs(parsed.query)
+            try:
+                offset = int(qs.get("candidate_offset", ["0"])[0])
+                limit = int(qs.get("candidate_limit", ["200"])[0])
+                self._send_json(wb.state(offset, limit))
+            except (TypeError, ValueError) as exc:
+                self._reject(400, f"候选分页参数无效：{exc}")
             return
         if self.path == "/api/about":
             from . import AUTHOR, PRODUCT_NAME, VERSION
@@ -288,7 +296,11 @@ class Handler(BaseHTTPRequestHandler):
             if len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha):
                 self._reject(400, "非法 SHA-256（须为 64 位十六进制）")
                 return
-            data = wb.original_bytes(sha)
+            try:
+                data = wb.original_bytes(sha)
+            except ValueError as exc:
+                self._reject(409, str(exc))
+                return
             if data is None:
                 self._reject(404, "工作区中不存在该 SHA-256 的原件")
                 return
@@ -335,8 +347,19 @@ class Handler(BaseHTTPRequestHandler):
             if body is None:
                 return
             if name.lower().endswith(".zip"):
-                results = wb.ingest_zip(name, body, source_type)
-                self._send_json({"ok": True, "results": results})
+                try:
+                    def ingest_zip_job(progress, stop):
+                        results = wb.ingest_zip(name, body, source_type,
+                                                progress=progress,
+                                                cancelled=stop.is_set)
+                        return {"results": results,
+                                "cancelled": stop.is_set()}
+                    job = self.server.start_job(
+                        "zip_upload", ingest_zip_job)
+                except RuntimeError as exc:
+                    self._reject(409, str(exc))
+                    return
+                self._send_json({"ok": True, "job_id": job["job_id"]})
             elif name.lower().endswith(".docx") and _docx_has_media(body):
                 try:
                     job = self.server.start_job(
@@ -374,7 +397,27 @@ class Handler(BaseHTTPRequestHandler):
                 req.get("field"), req.get("value"),
                 req.get("evidence_id"), req.get("action", "confirm"),
                 req.get("original_candidate"),
-                req.get("source_role", "unknown")))
+                req.get("source_role", "unknown"),
+                req.get("person_id")))
+            return
+        if route == "/api/confirm_amount":
+            req = self._read_json()
+            if req is None:
+                return
+            self._send_json(wb.confirm_amount(
+                req.get("event_id"), req.get("lot_id"), req.get("bidder_id"),
+                req.get("raw_value"), req.get("unit"), req.get("currency"),
+                req.get("tax_included"), req.get("evidence_id"),
+                req.get("action", "confirm"), req.get("original_candidate")))
+            return
+        if route == "/api/bind_file":
+            req = self._read_json()
+            if req is None:
+                return
+            self._send_json(wb.bind_file(
+                req.get("event_id"), req.get("lot_id"), req.get("bidder_id"),
+                req.get("sha256"), req.get("context"), req.get("source_type"),
+                req.get("declared_owner_id"), req.get("declared_uscc")))
             return
         if route == "/api/reject_record":
             # 页面枚举/超限拒收上报：只收小型 JSON 记录，复用 record_rejected
@@ -431,7 +474,15 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 result = wb.run_screen()
             except ValueError as exc:
-                self._reject(400, f"确认数据无法筛查：{exc}")
+                wb.record_screen_failure(str(exc))
+                self._send_json({"run_status": "failed",
+                                 "error": f"确认数据无法筛查：{exc}"}, 400)
+                return
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                wb.record_screen_failure(error)
+                self._send_json({"run_status": "failed",
+                                 "error": "筛查执行失败，失败状态已记录"}, 500)
                 return
             self._send_json(result)
             return

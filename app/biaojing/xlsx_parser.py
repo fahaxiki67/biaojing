@@ -26,6 +26,9 @@
 from __future__ import annotations
 
 import io
+import posixpath
+import xml.etree.ElementTree as ET
+import zipfile
 
 import openpyxl
 
@@ -33,13 +36,17 @@ from .model import json_safe
 
 PARSER_NAME = f"openpyxl {openpyxl.__version__}"
 EXTRACT_METHOD = (
-    "openpyxl 双次加载（公式视图 + data_only 缓存值视图），遍历全部工作表"
+    "openpyxl 双只读流式加载（公式视图 + data_only 缓存值视图），遍历全部工作表"
     "（含 hidden/veryHidden），逐单元格抽取原值/公式/缓存值/数字格式/批注；"
     "扫描行数与扫描单元格总数设硬上限，触顶降为 partial 并记录已扫描量"
 )
 
 DEFAULT_MAX_SCAN_ROWS = 50_000
 DEFAULT_MAX_SCAN_CELLS = 2_000_000
+EXTRACTION_VERSION = (
+    f"{PARSER_NAME}; read-only streaming; formula/cache paired; comments via OOXML; "
+    f"rows={DEFAULT_MAX_SCAN_ROWS}; cells={DEFAULT_MAX_SCAN_CELLS}; v1"
+)
 
 
 class _HeldBytesIO(io.BytesIO):
@@ -55,18 +62,72 @@ class _HeldBytesIO(io.BytesIO):
         pass
 
 
+def _comments_by_sheet(data: bytes) -> tuple[dict, list[str]]:
+    """只读解压 OOXML 批注部件，避免为批注把整本工作簿载入内存。"""
+    ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    rel_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    pkg_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+    comments, notes = {}, []
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as package:
+            workbook = ET.fromstring(package.read("xl/workbook.xml"))
+            relationships = ET.fromstring(
+                package.read("xl/_rels/workbook.xml.rels"))
+            targets = {r.attrib["Id"]: r.attrib["Target"]
+                       for r in relationships.findall(f"{{{pkg_ns}}}Relationship")}
+            names = set(package.namelist())
+            for sheet in workbook.findall(f"{{{ns}}}sheets/{{{ns}}}sheet"):
+                sheet_name = sheet.attrib.get("name", "")
+                target = targets.get(sheet.attrib.get(f"{{{rel_ns}}}id"))
+                if not target:
+                    continue
+                sheet_path = (posixpath.normpath(target.lstrip("/"))
+                              if target.startswith("/") else
+                              posixpath.normpath(posixpath.join("xl", target)))
+                rel_path = posixpath.join(posixpath.dirname(sheet_path), "_rels",
+                                          posixpath.basename(sheet_path) + ".rels")
+                if rel_path not in names:
+                    continue
+                rels = ET.fromstring(package.read(rel_path))
+                for rel in rels.findall(f"{{{pkg_ns}}}Relationship"):
+                    if not rel.attrib.get("Type", "").endswith("/comments"):
+                        continue
+                    comment_target = rel.attrib.get("Target", "")
+                    comment_path = (posixpath.normpath(comment_target.lstrip("/"))
+                                    if comment_target.startswith("/") else
+                                    posixpath.normpath(posixpath.join(
+                                        posixpath.dirname(sheet_path),
+                                        comment_target)))
+                    info = package.getinfo(comment_path)
+                    if info.file_size > 16 * 1024 * 1024:
+                        notes.append(f"工作表 [{sheet_name}] 批注部件超过 16MB，批注未读取")
+                        continue
+                    root = ET.fromstring(package.read(comment_path))
+                    sheet_comments = comments.setdefault(sheet_name, {})
+                    for comment in root.findall(f".//{{{ns}}}comment"):
+                        text_node = comment.find(f"{{{ns}}}text")
+                        value = "" if text_node is None else "".join(
+                            node.text or "" for node in text_node.iter()
+                            if node.tag.rsplit("}", 1)[-1] == "t")
+                        sheet_comments[comment.attrib.get("ref", "")] = value
+    except (OSError, KeyError, ValueError, ET.ParseError, zipfile.BadZipFile) as exc:
+        notes.append(f"Excel 批注读取不完整：{type(exc).__name__}: {exc}")
+    return comments, notes
+
+
 def parse(data: bytes, max_cells: int = 20_000,
           max_scan_rows: int = DEFAULT_MAX_SCAN_ROWS,
           max_scan_cells: int = DEFAULT_MAX_SCAN_CELLS) -> dict:
-    notes = []
+    comments, comment_notes = _comments_by_sheet(data)
+    notes = list(comment_notes)
     evidence_truncated = False
     scan_truncated = False
     wb_f = openpyxl.load_workbook(
-        _HeldBytesIO(data), data_only=False, read_only=False, keep_vba=False
+        _HeldBytesIO(data), data_only=False, read_only=True, keep_vba=False
     )
     try:
         wb_v = openpyxl.load_workbook(
-            _HeldBytesIO(data), data_only=True, read_only=False, keep_vba=False
+            _HeldBytesIO(data), data_only=True, read_only=True, keep_vba=False
         )
     except Exception as exc:
         wb_f.close()
@@ -81,6 +142,7 @@ def parse(data: bytes, max_cells: int = 20_000,
         sheets_total = sheets_hidden = 0
         cells_total = formulas_total = cached_unknown = 0
         scanned_rows_total = scanned_cells_total = 0
+        comments_incomplete = bool(comment_notes)
 
         sheet_views = wb_v.worksheets
         for idx, ws in enumerate(wb_f.worksheets):
@@ -102,11 +164,12 @@ def parse(data: bytes, max_cells: int = 20_000,
                 "dimension_rows_x_cols": declared,
             })
             ws_v = sheet_views[idx] if idx < len(sheet_views) else None
-            # 逐行窗口式扫描：每行单独调 iter_rows 并把 max_col 裁剪到剩余
-            # 单元格配额，openpyxl 每行最多生成 min(行宽, 剩余配额) 个 Cell，
-            # 从根上杜绝"单行 16,384 格（XFD）全量生成再丢弃"的耗时失控。
             sheet_max_col = ws.max_column or 1
             sheet_max_row = ws.max_row or 1
+            stream_width = min(sheet_max_col, max_scan_cells)
+            formula_rows = ws.iter_rows(max_col=stream_width)
+            value_rows = (ws_v.iter_rows(max_col=stream_width)
+                          if ws_v is not None else None)
             row_idx = 1
             while row_idx <= sheet_max_row:
                 remaining = max_scan_cells - scanned_cells_total
@@ -124,27 +187,26 @@ def parse(data: bytes, max_cells: int = 20_000,
                         f"{max_scan_rows} 行 / {max_scan_cells} 单元格，计数含空格），"
                         "该表及其后未扫部分如实降为 partial")
                     break
-                bounded_max_col = min(sheet_max_col, remaining)
-                row = next(ws.iter_rows(
-                    min_row=row_idx, max_row=row_idx,
-                    min_col=1, max_col=bounded_max_col,
-                ))
+                row = next(formula_rows, None)
+                if row is None:
+                    break
+                value_row = next(value_rows, None) if value_rows is not None else None
                 scanned_rows_total += 1
                 row_idx += 1
-                # 行内截断：本行右侧格子因配额未扫。必须立刻置位——若本行
-                # 恰为最后一行，while 会正常退出，不置位就会把半行漏扫
-                # 误判成 success（静默漏项）
-                row_cut_short = bounded_max_col < sheet_max_col
+                take = min(len(row), remaining)
+                row_cut_short = take < sheet_max_col
                 if row_cut_short:
                     scan_truncated = True
                     notes.append(
                         f"工作表 [{ws.title}] 扫描触顶（硬上限："
                         f"{max_scan_rows} 行 / {max_scan_cells} 单元格，计数含空格），"
                         "该表及其后未扫部分如实降为 partial")
-                for cell in row:
+                for column, cell in enumerate(row[:take]):
                     scanned_cells_total += 1
                     value = cell.value
-                    comment = cell.comment.text if cell.comment is not None else None
+                    coordinate = (
+                        f"{openpyxl.utils.get_column_letter(column + 1)}{row_idx - 1}")
+                    comment = comments.get(ws.title, {}).get(coordinate)
                     if value is None and comment is None:
                         continue
                     if len(evidence) >= max_cells:
@@ -154,7 +216,9 @@ def parse(data: bytes, max_cells: int = 20_000,
                     cached = None
                     if is_formula:
                         formulas_total += 1
-                        cv = ws_v[cell.coordinate].value if ws_v is not None else None
+                        cv = (value_row[column].value
+                              if value_row is not None and column < len(value_row)
+                              else None)
                         if cv is None:
                             cached = "unknown"
                             cached_unknown += 1
@@ -162,9 +226,9 @@ def parse(data: bytes, max_cells: int = 20_000,
                             cached = json_safe(cv)
                     rec = {
                         "kind": "xlsx_cell",
-                        "locator": f"{ws.title}!{cell.coordinate}",
+                        "locator": f"{ws.title}!{coordinate}",
                         "sheet": ws.title,
-                        "cell": cell.coordinate,
+                        "cell": coordinate,
                         "value": json_safe(value),
                         "number_format": cell.number_format,
                     }
@@ -190,12 +254,13 @@ def parse(data: bytes, max_cells: int = 20_000,
             "scanned_cells_total": scanned_cells_total,
             "scan_truncated": scan_truncated,
             "evidence_truncated": evidence_truncated,
+            "comments_incomplete": comments_incomplete,
             "cells_total": cells_total,
             "formulas_total": formulas_total,
             "formulas_cached_unknown": cached_unknown,
         }
 
-        if scan_truncated or evidence_truncated:
+        if scan_truncated or evidence_truncated or comments_incomplete:
             status = "partial"
         elif cells_total == 0:
             return {

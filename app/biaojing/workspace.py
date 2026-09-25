@@ -21,11 +21,12 @@ import json
 import os
 import re
 import sqlite3
+import tempfile
 import threading
 
 from . import candidates
 from . import store as p2_store
-from .rules import FactBase, SCHEMA, screen_all
+from .rules import FactBase, RULE_VERSION, SCHEMA, screen_all
 
 MAX_UPLOAD_BYTES = 128 * 1024 * 1024  # 单文件/请求体硬上限
 
@@ -50,14 +51,64 @@ CREATE TABLE IF NOT EXISTS candidates(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     sha256 TEXT, field TEXT, value_json TEXT, evidence_id TEXT,
     locator_json TEXT, locator_display TEXT, note TEXT,
-    companion_json TEXT);
+    companion_json TEXT,
+    candidate_meta_json TEXT);
 CREATE TABLE IF NOT EXISTS confirmations(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     event_id TEXT NOT NULL, lot_id TEXT NOT NULL, bidder_id TEXT NOT NULL,
     field TEXT NOT NULL, value TEXT, evidence_id TEXT,
     source_role TEXT DEFAULT 'unknown',
     original_candidate TEXT, action TEXT, confirmed_at TEXT,
+    person_id TEXT, evidence_version INTEGER,
     UNIQUE(event_id, lot_id, bidder_id, field));
+CREATE TABLE IF NOT EXISTS confirmation_history(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL, lot_id TEXT NOT NULL, bidder_id TEXT NOT NULL,
+    field TEXT NOT NULL, old_value TEXT, new_value TEXT,
+    old_evidence_id TEXT, evidence_id TEXT, action TEXT NOT NULL,
+    original_candidate TEXT, person_id TEXT, evidence_version INTEGER,
+    actor TEXT NOT NULL DEFAULT '本机用户', changed_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_confirmation_history_scope
+    ON confirmation_history(event_id, lot_id, bidder_id, field, id);
+CREATE TABLE IF NOT EXISTS contact_facts(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL, lot_id TEXT NOT NULL, bidder_id TEXT NOT NULL,
+    field TEXT NOT NULL, value TEXT NOT NULL, evidence_id TEXT,
+    source_role TEXT NOT NULL DEFAULT 'unknown', original_candidate TEXT,
+    action TEXT NOT NULL, confirmed_at TEXT NOT NULL,
+    UNIQUE(event_id, lot_id, bidder_id, field, evidence_id));
+CREATE TABLE IF NOT EXISTS person_facts(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL, lot_id TEXT NOT NULL, bidder_id TEXT NOT NULL,
+    field TEXT NOT NULL, value TEXT NOT NULL, evidence_id TEXT,
+    person_id TEXT, original_candidate TEXT, action TEXT NOT NULL,
+    evidence_version INTEGER, confirmed_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_person_facts_scope
+    ON person_facts(event_id, lot_id, bidder_id, field, id);
+CREATE TABLE IF NOT EXISTS file_bindings(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL, lot_id TEXT NOT NULL, bidder_id TEXT NOT NULL,
+    sha256 TEXT NOT NULL, context TEXT NOT NULL DEFAULT 'bid_document',
+    source_type TEXT NOT NULL DEFAULT 'unknown', declared_owner_id TEXT,
+    declared_uscc TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    UNIQUE(event_id, lot_id, bidder_id, sha256));
+CREATE TABLE IF NOT EXISTS file_binding_history(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL, lot_id TEXT NOT NULL, bidder_id TEXT NOT NULL,
+    sha256 TEXT NOT NULL, old_value TEXT, new_value TEXT NOT NULL,
+    changed_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS evidence_versions(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    evidence_id TEXT NOT NULL, version INTEGER NOT NULL,
+    quote TEXT NOT NULL, ocr_used INTEGER NOT NULL DEFAULT 0,
+    page_status TEXT, page_error TEXT, page_note TEXT,
+    extract_version TEXT, created_at TEXT NOT NULL,
+    UNIQUE(evidence_id, version));
+CREATE TABLE IF NOT EXISTS screen_runs(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, run_at TEXT NOT NULL,
+    rules_version TEXT NOT NULL, facts_sha256 TEXT NOT NULL,
+    facts_json TEXT NOT NULL, outcome_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'completed', error TEXT);
 CREATE TABLE IF NOT EXISTS findings_log(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_at TEXT, findings_json TEXT NOT NULL);
@@ -99,12 +150,20 @@ class Workbench:
         if cols and "companion_json" not in cols:
             self.conn.execute(
                 "ALTER TABLE candidates ADD COLUMN companion_json TEXT")
+        if cols and "candidate_meta_json" not in cols:
+            self.conn.execute(
+                "ALTER TABLE candidates ADD COLUMN candidate_meta_json TEXT")
         conf_cols = {r[1] for r in self.conn.execute(
             "PRAGMA table_info(confirmations)")}
         if conf_cols and "source_role" not in conf_cols:
             self.conn.execute(
                 "ALTER TABLE confirmations ADD COLUMN source_role TEXT"
                 " DEFAULT 'unknown'")
+        for col, sql_type in (("person_id", "TEXT"),
+                              ("evidence_version", "INTEGER")):
+            if conf_cols and col not in conf_cols:
+                self.conn.execute(
+                    f"ALTER TABLE confirmations ADD COLUMN {col} {sql_type}")
         evidence_cols = {r[1] for r in self.conn.execute(
             "PRAGMA table_info(evidence_store)")}
         if evidence_cols and "ocr_used" not in evidence_cols:
@@ -154,6 +213,53 @@ class Workbench:
         self.conn.execute(
             "UPDATE sources SET extract_version=COALESCE(extract_version,"
             " 'legacy（导入时未记录解析版本）') WHERE extract_version IS NULL")
+        run_cols = {r[1] for r in self.conn.execute(
+            "PRAGMA table_info(screen_runs)")}
+        if run_cols and "status" not in run_cols:
+            self.conn.execute(
+                "ALTER TABLE screen_runs ADD COLUMN status TEXT NOT NULL"
+                " DEFAULT 'completed'")
+        if run_cols and "error" not in run_cols:
+            self.conn.execute("ALTER TABLE screen_runs ADD COLUMN error TEXT")
+        self.conn.execute(
+            "INSERT OR IGNORE INTO evidence_versions"
+            " (evidence_id, version, quote, ocr_used, page_status, page_error,"
+            " page_note, extract_version, created_at)"
+            " SELECT evidence_id, 1, quote, ocr_used, page_status, page_error,"
+            " page_note, extract_version, ? FROM evidence_store",
+            (_now(),))
+        migrated = self.conn.execute(
+            "SELECT value FROM meta WHERE key='contact_facts_migrated'").fetchone()
+        if not migrated:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO contact_facts"
+                " (event_id, lot_id, bidder_id, field, value, evidence_id,"
+                " source_role, original_candidate, action, confirmed_at)"
+                " SELECT event_id, lot_id, bidder_id, field, value, evidence_id,"
+                " COALESCE(source_role, 'unknown'), original_candidate,"
+                " COALESCE(action, 'confirm'), COALESCE(confirmed_at, ? )"
+                " FROM confirmations WHERE field IN"
+                " ('contact_phone','contact_email','bank_account')"
+                " AND evidence_id IS NOT NULL",
+                (_now(),))
+            self.conn.execute(
+                "INSERT OR REPLACE INTO meta(key,value)"
+                " VALUES('contact_facts_migrated','1')")
+        people_migrated = self.conn.execute(
+            "SELECT value FROM meta WHERE key='person_facts_migrated'").fetchone()
+        if not people_migrated:
+            self.conn.execute(
+                "INSERT INTO person_facts"
+                " (event_id,lot_id,bidder_id,field,value,evidence_id,person_id,"
+                " original_candidate,action,evidence_version,confirmed_at)"
+                " SELECT event_id,lot_id,bidder_id,field,value,evidence_id,person_id,"
+                " original_candidate,COALESCE(action,'confirm'),evidence_version,"
+                " COALESCE(confirmed_at,?) FROM confirmations WHERE field IN"
+                " ('person_manager','person_tech','authorize_rep','legal_rep','id_number')",
+                (_now(),))
+            self.conn.execute(
+                "INSERT OR REPLACE INTO meta(key,value)"
+                " VALUES('person_facts_migrated','1')")
 
     @_locked
     def close(self):
@@ -162,15 +268,31 @@ class Workbench:
     # ------------------------------------------------------------ 上传/解析
 
     def _persist_bytes(self, data: bytes) -> str:
-        """原始字节按 SHA-256 哈希路径只读保存，返回 sha256。"""
+        """原件原子写入哈希路径；已存在文件必须重新校验。"""
         import hashlib
 
         sha = hashlib.sha256(data).hexdigest()
         file_path = os.path.join(self.root, "files", sha[:2], sha)
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        if not os.path.exists(file_path):
-            with open(file_path, "wb") as f:
-                f.write(data)
+        if os.path.exists(file_path):
+            with open(file_path, "rb") as existing:
+                if hashlib.sha256(existing.read()).hexdigest() != sha:
+                    raise ValueError("哈希路径原件完整性校验失败，已停止覆盖")
+            return sha
+        fd, temp_path = tempfile.mkstemp(prefix=".biaojing-original-",
+                                         dir=os.path.dirname(file_path))
+        try:
+            with os.fdopen(fd, "wb") as output:
+                output.write(data)
+                output.flush()
+                os.fsync(output.fileno())
+            with open(temp_path, "rb") as check:
+                if hashlib.sha256(check.read()).hexdigest() != sha:
+                    raise ValueError("原件写入后 SHA-256 校验失败")
+            os.replace(temp_path, file_path)
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
         return sha
 
     @_locked
@@ -211,10 +333,11 @@ class Workbench:
             seen_sha={}, progress=progress, cancelled=cancelled)
         doc_type = rec.get("doc_type", "unknown")
         status = rec.get("extract_status", "failed")
-        from . import docx_parser, pdf_parser
+        from . import docx_parser, pdf_parser, xlsx_parser
         extract_version = (
             pdf_parser.EXTRACTION_VERSION if doc_type == "pdf" else
             docx_parser.EXTRACTION_VERSION if doc_type == "docx" else
+            xlsx_parser.EXTRACTION_VERSION if doc_type == "xlsx" else
             rec.get("parser") or "P1 未记录")
         self.conn.execute(
             "INSERT INTO sources(sha256, doc_type, status, parser, counts_json,"
@@ -244,19 +367,33 @@ class Workbench:
                      e.get("page"), e.get("page_status"), e.get("page_error"),
                      e.get("page_note"),
                      extract_version))
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO evidence_versions"
+                    " (evidence_id, version, quote, ocr_used, page_status,"
+                    " page_error, page_note, extract_version, created_at)"
+                    " VALUES(?,1,?,?,?,?,?,?,?)",
+                    (e["evidence_id"], quote,
+                     int(bool(e.get("ocr_used", False))), e.get("page_status"),
+                     e.get("page_error"), e.get("page_note"), extract_version,
+                     now))
             cands = candidates.extract_candidates(sha, doc_type, tagged)
             for c in cands:
                 self.conn.execute(
                     "INSERT INTO candidates(sha256, field, value_json,"
                     " evidence_id, locator_json, locator_display, note,"
-                    " companion_json) VALUES(?,?,?,?,?,?,?,?)",
+                    " companion_json, candidate_meta_json)"
+                    " VALUES(?,?,?,?,?,?,?,?,?)",
                     (sha, c["field"],
                      json.dumps(c["value"], ensure_ascii=False, default=str),
                      c["evidence_id"],
                      json.dumps(c["locator"], ensure_ascii=False),
                      c.get("locator_display", ""), c.get("note", ""),
                      json.dumps(c.get("companion"), ensure_ascii=False)
-                     if c.get("companion") else None))
+                     if c.get("companion") else None,
+                     json.dumps({k: c[k] for k in ("currency_hint", "evidence_ids")
+                                 if c.get(k) is not None}, ensure_ascii=False)
+                     if c.get("currency_hint") is not None or c.get("evidence_ids")
+                     else None))
         else:
             cands = []
         # 该次出现的状态 = 主解析状态（duplicate 出现已在前面标记）
@@ -307,6 +444,18 @@ class Workbench:
             sha256, "pdf", [e for e in updated.values() if (e.get("text") or "").strip()])
         with self.conn:
             for ev in updated.values():
+                version = self.conn.execute(
+                    "SELECT COALESCE(MAX(version),0)+1 FROM evidence_versions"
+                    " WHERE evidence_id=?", (ev["evidence_id"],)).fetchone()[0]
+                self.conn.execute(
+                    "INSERT INTO evidence_versions"
+                    " (evidence_id,version,quote,ocr_used,page_status,page_error,"
+                    " page_note,extract_version,created_at)"
+                    " VALUES(?,?,?,?,?,?,?,?,?)",
+                    (ev["evidence_id"], version, ev.get("text", ""),
+                     int(bool(ev.get("ocr_used"))), ev.get("page_status"),
+                     ev.get("page_error"), ev.get("page_note"),
+                     pdf_parser.EXTRACTION_VERSION, _now()))
                 self.conn.execute(
                     "UPDATE evidence_store SET quote=?, ocr_used=?, page_status=?,"
                     " page_error=?, page_note=?, extract_version=?"
@@ -318,14 +467,18 @@ class Workbench:
             for c in new_candidates:
                 self.conn.execute(
                     "INSERT INTO candidates(sha256, field, value_json, evidence_id,"
-                    " locator_json, locator_display, note, companion_json)"
-                    " VALUES(?,?,?,?,?,?,?,?)",
+                    " locator_json, locator_display, note, companion_json,"
+                    " candidate_meta_json) VALUES(?,?,?,?,?,?,?,?,?)",
                     (sha256, c["field"],
                      json.dumps(c["value"], ensure_ascii=False, default=str),
                      c["evidence_id"], json.dumps(c["locator"], ensure_ascii=False),
                      c.get("locator_display", ""), c.get("note", ""),
                      json.dumps(c.get("companion"), ensure_ascii=False)
-                     if c.get("companion") else None))
+                     if c.get("companion") else None,
+                     json.dumps({k: c[k] for k in ("currency_hint", "evidence_ids")
+                                 if c.get(k) is not None}, ensure_ascii=False)
+                     if c.get("currency_hint") is not None or c.get("evidence_ids")
+                     else None))
             statuses = [r["page_status"] or "pending_ocr" for r in self.conn.execute(
                 "SELECT page_status FROM evidence_store WHERE sha256=?"
                 " AND kind='pdf_page'", (sha256,))]
@@ -385,7 +538,8 @@ class Workbench:
 
     @_locked
     def ingest_zip(self, name: str, data: bytes,
-                   source_type: str = "unknown") -> list[dict]:
+                   source_type: str = "unknown", progress=None,
+                   cancelled=None) -> list[dict]:
         """ZIP：容器本体按哈希存证并记归档级 occurrence；同 SHA 重复上传
         记 duplicate 但仍展开条目（条目各成 duplicate）；展开失败把该归档
         occurrence 原地更新为 failed（不留 archived+failed 双行）；
@@ -429,9 +583,20 @@ class Workbench:
             results.append({"sha256": sha, "status": "failed", "ref": name,
                             "error": str(exc)})
             return results
-        for entry in expanded["entries"]:
-            results.append(self.ingest_bytes(f"{name}::{entry['name']}",
-                                             entry["data"], source_type))
+        entries = expanded["entries"]
+        for index, entry in enumerate(entries, start=1):
+            if cancelled and cancelled():
+                results.append({"status": "cancelled", "ref": name,
+                                "error": f"已处理 {index - 1}/{len(entries)} 个归档成员"})
+                break
+            if progress:
+                progress(index, len(entries), "解析归档成员", "processing")
+            results.append(self.ingest_bytes(
+                f"{name}::{entry['name']}", entry["data"], source_type,
+                progress=lambda page, total, stage, status, i=index: progress(
+                    i, len(entries), f"{entry['name']}：{stage}", status)
+                if progress else None,
+                cancelled=cancelled))
         for rej in expanded["rejected"]:
             ref = f"{name}::{rej['name']}"
             self.conn.execute(
@@ -501,11 +666,16 @@ class Workbench:
 
     @_locked
     def original_bytes(self, sha256: str) -> bytes | None:
+        import hashlib
+
         path = os.path.join(self.root, "files", sha256[:2], sha256)
         if not os.path.isfile(path):
             return None
         with open(path, "rb") as f:
-            return f.read()
+            data = f.read()
+        if hashlib.sha256(data).hexdigest() != sha256:
+            raise ValueError("原件 SHA-256 校验失败，拒绝下载或继续处理")
+        return data
 
     @_locked
     def display_name_for(self, sha256: str) -> str | None:
@@ -532,11 +702,19 @@ class Workbench:
             "page_no": row["page_no"], "page_status": row["page_status"],
             "page_error": row["page_error"], "page_note": row["page_note"],
             "extract_version": row["extract_version"],
+            "version": self.conn.execute(
+                "SELECT MAX(version) FROM evidence_versions"
+                " WHERE evidence_id=?", (evidence_id,)).fetchone()[0] or 1,
         }
 
     @_locked
-    def state(self) -> dict:
-        """全量状态：覆盖率（按输入出现次数）+ 来源/候选/确认/最近筛查。"""
+    def state(self, candidate_offset: int = 0,
+              candidate_limit: int = 200) -> dict:
+        """返回工作台状态和一页候选，避免每次刷新装入全部候选。"""
+        if type(candidate_offset) is not int or candidate_offset < 0:
+            raise ValueError("candidate_offset 须为非负整数")
+        if type(candidate_limit) is not int or not 1 <= candidate_limit <= 500:
+            raise ValueError("candidate_limit 须为 1 到 500")
         cov = self.coverage()
         sources = [dict(r) for r in self.conn.execute(
             "SELECT sha256, doc_type, status, parser, counts_json,"
@@ -545,30 +723,88 @@ class Workbench:
         # 来源行：每次输入出现一行（含 duplicate/rejected），重复可见
         source_rows = [dict(r) for r in self.conn.execute(
             "SELECT r.ref, r.status, r.reason, s.doc_type, s.parser,"
-            " s.sha256, s.counts_json, s.extract_version"
+            " s.sha256, s.counts_json, s.extract_version, s.source_type"
             " FROM source_refs r LEFT JOIN sources s ON s.sha256 = r.sha256"
             " ORDER BY r.id")]
+        candidate_total = self.conn.execute(
+            "SELECT COUNT(*) FROM candidates").fetchone()[0]
         cands = [dict(r) for r in self.conn.execute(
             "SELECT id, sha256, field, value_json, evidence_id,"
-            " locator_display, note, companion_json FROM candidates ORDER BY id")]
+            " locator_display, note, companion_json, candidate_meta_json"
+            " FROM candidates ORDER BY id LIMIT ? OFFSET ?",
+            (candidate_limit, candidate_offset))]
         for c in cands:
             c["value"] = json.loads(c.pop("value_json"))
             comp = c.pop("companion_json")
             c["companion"] = json.loads(comp) if comp else None
+            meta = c.pop("candidate_meta_json")
+            c.update(json.loads(meta) if meta else {})
         confirms = [dict(r) for r in self.conn.execute(
             "SELECT event_id, lot_id, bidder_id, field, value, evidence_id,"
-            " original_candidate, action, confirmed_at FROM confirmations"
+            " source_role, original_candidate, action, confirmed_at, person_id,"
+            " evidence_version FROM confirmations WHERE field NOT IN"
+            " ('contact_phone','contact_email','bank_account','person_manager',"
+            " 'person_tech','authorize_rep','legal_rep','id_number')"
             " ORDER BY id")]
+        confirms.extend(dict(r) for r in self.conn.execute(
+            "SELECT event_id, lot_id, bidder_id, field, value, evidence_id,"
+            " source_role, original_candidate, action, confirmed_at"
+            " FROM contact_facts WHERE action IN ('confirm','correct','unknown')"
+            " ORDER BY id"))
+        confirms.extend(dict(r) for r in self.conn.execute(
+            "SELECT event_id,lot_id,bidder_id,field,value,evidence_id,person_id,"
+            " original_candidate,action,confirmed_at,evidence_version"
+            " FROM person_facts WHERE action IN ('confirm','correct','unknown')"
+            " ORDER BY id"))
+        history_total = self.conn.execute(
+            "SELECT COUNT(*) FROM confirmation_history").fetchone()[0]
+        history = [dict(r) for r in self.conn.execute(
+            "SELECT event_id, lot_id, bidder_id, field, old_value, new_value,"
+            " old_evidence_id, evidence_id, action, original_candidate,"
+            " person_id, evidence_version, actor, changed_at"
+            " FROM confirmation_history ORDER BY id DESC LIMIT 100")]
+        binding_history_total = self.conn.execute(
+            "SELECT COUNT(*) FROM file_binding_history").fetchone()[0]
+        binding_history = [dict(r) for r in self.conn.execute(
+            "SELECT h.event_id,h.lot_id,h.bidder_id,h.sha256,h.old_value,"
+            " h.new_value,h.changed_at,(SELECT e.evidence_id FROM evidence_store e"
+            " WHERE e.sha256=h.sha256 ORDER BY e.ordinal LIMIT 1) AS evidence_id"
+            " FROM file_binding_history h ORDER BY h.id DESC LIMIT 100")]
         last_findings = self.conn.execute(
             "SELECT findings_json FROM findings_log ORDER BY id DESC LIMIT 1"
         ).fetchone()
         findings = json.loads(last_findings["findings_json"]) \
             if last_findings else None
+        last_run = self.conn.execute(
+            "SELECT run_at,rules_version,facts_sha256,outcome_json,status,error"
+            " FROM screen_runs ORDER BY id DESC LIMIT 1").fetchone()
+        last_outcome = json.loads(last_run["outcome_json"]) if last_run else {}
+        last_screen_run = ({
+            "run_at": last_run["run_at"],
+            "rules_version": last_run["rules_version"],
+            "facts_sha256": last_run["facts_sha256"],
+            "status": last_run["status"], "error": last_run["error"],
+            "rule_statuses": last_outcome.get("rule_statuses", {}),
+            "import": last_outcome.get("import"),
+        } if last_run else {"status": "not_run"})
         return {
             "product": "标镜", "product_name": "标镜",
             "coverage": cov, "sources": sources, "source_rows": source_rows,
             "candidates": cands, "confirmations": confirms,
+            "candidate_total": candidate_total,
+            "candidate_offset": candidate_offset,
+            "candidate_limit": candidate_limit,
+            "candidate_has_more": candidate_offset + len(cands) < candidate_total,
+            "confirmation_history": history,
+            "confirmation_history_total": history_total,
+            "file_binding_history": binding_history,
+            "file_binding_history_total": binding_history_total,
+            "file_bindings": [dict(r) for r in self.conn.execute(
+                "SELECT event_id, lot_id, bidder_id, sha256, context,"
+                " source_type, declared_owner_id, declared_uscc"
+                " FROM file_bindings ORDER BY id")],
             "findings": findings,
+            "last_screen_run": last_screen_run,
         }
 
     # ------------------------------------------------------------ 确认字段
@@ -578,7 +814,8 @@ class Workbench:
                       field: str, value, evidence_id: str | None,
                       action: str = "confirm",
                       original_candidate: str | None = None,
-                      source_role: str = "unknown") -> dict:
+                      source_role: str = "unknown",
+                      person_id: str | None = None) -> dict:
         """确认/更正/标 unknown 一个字段。
 
         校验（全部通过才写库，否则拒绝且不留任何行）：
@@ -604,6 +841,9 @@ class Workbench:
             return {"ok": False, "error": "evidence_id 必须是字符串"}
         if original_candidate is not None and not isinstance(original_candidate, str):
             return {"ok": False, "error": "original_candidate 必须是字符串"}
+        if person_id is not None and (not isinstance(person_id, str)
+                                      or len(person_id.strip()) > 128):
+            return {"ok": False, "error": "person_id 必须是 128 字以内的字符串"}
         if action in ("confirm", "correct"):
             if evidence_id is None or not self.evidence_usable(evidence_id):
                 return {"ok": False,
@@ -612,32 +852,361 @@ class Workbench:
         if action == "unknown":
             value = "unknown"
             evidence_id = None
-        if field == "total_price" and action in ("confirm", "correct"):
-            if isinstance(value, bool) or not isinstance(value, (int, float)) \
-                    or value != value or value in (float("inf"), float("-inf")):
-                return {"ok": False,
-                        "error": "total_price 只接受有限数值（布尔与非数值"
-                                 "一律拒绝，unknown 用 unknown 操作表达）"}
+        if field == "total_price":
+            return {"ok": False,
+                    "error": "总报价须通过原子金额确认接口，同时确认单位、币种和税口径"}
         if field == "tax_included" and action in ("confirm", "correct") \
                 and not isinstance(value, bool):
             return {"ok": False,
                     "error": "tax_included 只接受布尔值（unknown 用 unknown"
                              " 操作表达）"}
+        if field == "price_lines" and action in ("confirm", "correct"):
+            if not isinstance(value, list) or not value:
+                return {"ok": False, "error": "清单报价须为非空行列表"}
+            from .money import parse_amount
+            for index, line in enumerate(value, start=1):
+                if not isinstance(line, dict):
+                    return {"ok": False, "error": f"第 {index} 条清单行格式错误"}
+                line_evidence = line.get("evidence")
+                if not self.evidence_usable(line_evidence):
+                    return {"ok": False,
+                            "error": f"第 {index} 条清单行缺少有效单价证据"}
+                price = line.get("unit_price")
+                if price is not None and parse_amount(price, "yuan")["status"] != "normalized":
+                    return {"ok": False, "error": f"第 {index} 条单价不是有限金额"}
+                tax = line.get("tax_included")
+                if tax is not None and type(tax) is not bool:
+                    return {"ok": False, "error": f"第 {index} 条税口径只能为布尔值或 unknown"}
+                field_evidence = line.get("field_evidence") or {}
+                if not isinstance(field_evidence, dict) or any(
+                        not self.evidence_usable(eid)
+                        for eid in field_evidence.values() if eid):
+                    return {"ok": False, "error": f"第 {index} 条清单行字段证据无效"}
+        if field == "outcome_result" and action in ("confirm", "correct"):
+            text = str(value).strip().casefold()
+            if any(x in text for x in ("未中标", "未中", "落标", "未获得", "否", "lost")):
+                value = "lost"
+            elif any(x in text for x in ("中标", "已中标", "是", "won")):
+                value = "won"
+            else:
+                return {"ok": False, "error": "中标结果须明确为中标或未中标"}
+        if field in ("contact_phone", "contact_email", "bank_account"):
+            self._save_contact(event_id, lot_id, bidder_id, field, value,
+                               evidence_id, source_role, original_candidate,
+                               action)
+        elif field in ("person_manager", "person_tech", "authorize_rep",
+                       "legal_rep", "id_number"):
+            self._save_person(event_id, lot_id, bidder_id, field, value,
+                              evidence_id, person_id, original_candidate, action)
+        else:
+            with self.conn:
+                self._write_confirmation(
+                    event_id, lot_id, bidder_id, field, value, evidence_id,
+                    source_role, original_candidate, action, person_id)
+        return {"ok": True}
+
+    def _write_confirmation(self, event_id, lot_id, bidder_id, field, value,
+                            evidence_id, source_role, original_candidate,
+                            action, person_id=None):
+        """在调用方事务中追加历史并更新当前确认值。"""
+        old = self.conn.execute(
+            "SELECT value, evidence_id FROM confirmations"
+            " WHERE event_id=? AND lot_id=? AND bidder_id=? AND field=?",
+            (event_id, lot_id, bidder_id, field)).fetchone()
+        version = None
+        if evidence_id:
+            version_row = self.conn.execute(
+                "SELECT MAX(version) FROM evidence_versions WHERE evidence_id=?",
+                (evidence_id,)).fetchone()
+            version = version_row[0] if version_row else None
+        encoded = (json.dumps(str(value), ensure_ascii=False)
+                   if field == "total_price" else
+                   value if isinstance(value, str) else
+                   json.dumps(value, ensure_ascii=False, default=str))
+        now = _now()
         self.conn.execute(
-            "INSERT INTO confirmations(event_id, lot_id, bidder_id, field,"
-            " value, evidence_id, source_role, original_candidate, action,"
-            " confirmed_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?)"
-            " ON CONFLICT(event_id, lot_id, bidder_id, field) DO UPDATE SET"
-            " value=excluded.value, evidence_id=excluded.evidence_id,"
+            "INSERT INTO confirmation_history"
+            " (event_id,lot_id,bidder_id,field,old_value,new_value,"
+            " old_evidence_id,evidence_id,action,original_candidate,person_id,"
+            " evidence_version,actor,changed_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (event_id, lot_id, bidder_id, field,
+             old["value"] if old else None, encoded,
+             old["evidence_id"] if old else None, evidence_id, action,
+             original_candidate, person_id, version, "本机用户", now))
+        self.conn.execute(
+            "INSERT INTO confirmations(event_id,lot_id,bidder_id,field,value,"
+            " evidence_id,source_role,original_candidate,action,confirmed_at,"
+            " person_id,evidence_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(event_id,lot_id,bidder_id,field) DO UPDATE SET"
+            " value=excluded.value,evidence_id=excluded.evidence_id,"
             " source_role=excluded.source_role,"
             " original_candidate=excluded.original_candidate,"
-            " action=excluded.action, confirmed_at=excluded.confirmed_at",
-            (event_id, lot_id, bidder_id, field,
-             json.dumps(value, ensure_ascii=False, default=str)
-             if not isinstance(value, str) else value,
-             evidence_id, source_role, original_candidate, action, _now()))
-        self.conn.commit()
+            " action=excluded.action,confirmed_at=excluded.confirmed_at,"
+            " person_id=excluded.person_id,evidence_version=excluded.evidence_version",
+            (event_id, lot_id, bidder_id, field, encoded, evidence_id,
+             source_role, original_candidate, action, now, person_id, version))
+
+    def _save_contact(self, event_id, lot_id, bidder_id, field, value,
+                      evidence_id, source_role, original_candidate, action):
+        """按来源证据分别保存联系方式，避免后一个号码覆盖前一个。"""
+        old = self.conn.execute(
+            "SELECT value,evidence_id FROM contact_facts"
+            " WHERE event_id=? AND lot_id=? AND bidder_id=? AND field=?"
+            " AND evidence_id IS ? ORDER BY id DESC LIMIT 1",
+            (event_id, lot_id, bidder_id, field, evidence_id)).fetchone()
+        now = _now()
+        with self.conn:
+            if action == "unknown":
+                active = [dict(row) for row in self.conn.execute(
+                    "SELECT value,evidence_id FROM contact_facts"
+                    " WHERE event_id=? AND lot_id=? AND bidder_id=? AND field=?"
+                    " AND action IN ('confirm','correct')",
+                    (event_id, lot_id, bidder_id, field))]
+                self.conn.execute(
+                    "INSERT INTO confirmation_history"
+                    " (event_id,lot_id,bidder_id,field,old_value,new_value,"
+                    " evidence_id,action,original_candidate,actor,changed_at)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (event_id, lot_id, bidder_id, field,
+                     json.dumps(active, ensure_ascii=False), '"unknown"', None,
+                     action, original_candidate, "本机用户", now))
+                self.conn.execute(
+                    "UPDATE contact_facts SET action='superseded'"
+                    " WHERE event_id=? AND lot_id=? AND bidder_id=? AND field=?"
+                    " AND action IN ('confirm','correct','unknown')",
+                    (event_id, lot_id, bidder_id, field))
+                current = self.conn.execute(
+                    "SELECT id FROM contact_facts WHERE event_id=? AND lot_id=?"
+                    " AND bidder_id=? AND field=? AND evidence_id IS NULL"
+                    " ORDER BY id DESC LIMIT 1",
+                    (event_id, lot_id, bidder_id, field)).fetchone()
+                if current:
+                    self.conn.execute(
+                        "UPDATE contact_facts SET value='unknown',source_role='unknown',"
+                        " original_candidate=?,action='unknown',confirmed_at=?"
+                        " WHERE id=?",
+                        (original_candidate, now, current["id"]))
+                else:
+                    self.conn.execute(
+                        "INSERT INTO contact_facts"
+                        " (event_id,lot_id,bidder_id,field,value,evidence_id,source_role,"
+                        " original_candidate,action,confirmed_at)"
+                        " VALUES(?,?,?,?,?,NULL,'unknown',?,'unknown',?)",
+                        (event_id, lot_id, bidder_id, field, "unknown",
+                         original_candidate, now))
+                return
+            self.conn.execute(
+                "UPDATE contact_facts SET action='superseded'"
+                " WHERE event_id=? AND lot_id=? AND bidder_id=? AND field=?"
+                " AND evidence_id IS NULL AND action='unknown'",
+                (event_id, lot_id, bidder_id, field))
+            self.conn.execute(
+                "INSERT INTO confirmation_history"
+                " (event_id,lot_id,bidder_id,field,old_value,new_value,"
+                " old_evidence_id,evidence_id,action,original_candidate,actor,changed_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (event_id, lot_id, bidder_id, field,
+                 old["value"] if old else None,
+                 value if isinstance(value, str) else json.dumps(value, ensure_ascii=False),
+                 old["evidence_id"] if old else None, evidence_id, action,
+                 original_candidate, "本机用户", now))
+            self.conn.execute(
+                "INSERT INTO contact_facts"
+                " (event_id,lot_id,bidder_id,field,value,evidence_id,source_role,"
+                " original_candidate,action,confirmed_at) VALUES(?,?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(event_id,lot_id,bidder_id,field,evidence_id)"
+                " DO UPDATE SET value=excluded.value,source_role=excluded.source_role,"
+                " original_candidate=excluded.original_candidate,"
+                " action=excluded.action,confirmed_at=excluded.confirmed_at",
+                (event_id, lot_id, bidder_id, field,
+                 value if isinstance(value, str) else json.dumps(value, ensure_ascii=False),
+                 evidence_id, source_role, original_candidate, action, now))
+
+    def _save_person(self, event_id, lot_id, bidder_id, field, value,
+                     evidence_id, person_id, original_candidate, action):
+        """保存多名人员及独立人工身份 ID；同名不会自动合并。"""
+        now = _now()
+        encoded = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        pid = person_id.strip() if isinstance(person_id, str) and person_id.strip() else None
+        version = None
+        if evidence_id:
+            row = self.conn.execute(
+                "SELECT MAX(version) FROM evidence_versions WHERE evidence_id=?",
+                (evidence_id,)).fetchone()
+            version = row[0] if row else None
+        with self.conn:
+            if action == "unknown":
+                active = [dict(row) for row in self.conn.execute(
+                    "SELECT value,evidence_id,person_id FROM person_facts"
+                    " WHERE event_id=? AND lot_id=? AND bidder_id=? AND field=?"
+                    " AND action IN ('confirm','correct')",
+                    (event_id, lot_id, bidder_id, field))]
+                self.conn.execute(
+                    "INSERT INTO confirmation_history"
+                    " (event_id,lot_id,bidder_id,field,old_value,new_value,"
+                    " action,original_candidate,actor,changed_at)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (event_id, lot_id, bidder_id, field,
+                     json.dumps(active, ensure_ascii=False), '"unknown"',
+                     action, original_candidate, "本机用户", now))
+                self.conn.execute(
+                    "UPDATE person_facts SET action='superseded'"
+                    " WHERE event_id=? AND lot_id=? AND bidder_id=? AND field=?"
+                    " AND action IN ('confirm','correct','unknown')",
+                    (event_id, lot_id, bidder_id, field))
+                current = self.conn.execute(
+                    "SELECT id FROM person_facts WHERE event_id=? AND lot_id=?"
+                    " AND bidder_id=? AND field=? AND evidence_id IS NULL"
+                    " AND person_id IS NULL ORDER BY id DESC LIMIT 1",
+                    (event_id, lot_id, bidder_id, field)).fetchone()
+                if current:
+                    self.conn.execute(
+                        "UPDATE person_facts SET value='unknown',action='unknown',"
+                        " original_candidate=?,confirmed_at=? WHERE id=?",
+                        (original_candidate, now, current["id"]))
+                else:
+                    self.conn.execute(
+                        "INSERT INTO person_facts"
+                        " (event_id,lot_id,bidder_id,field,value,evidence_id,person_id,"
+                        " original_candidate,action,evidence_version,confirmed_at)"
+                        " VALUES(?,?,?,?,?,NULL,NULL,?,'unknown',NULL,?)",
+                        (event_id, lot_id, bidder_id, field, '"unknown"',
+                         original_candidate, now))
+                return
+            previous = self.conn.execute(
+                "SELECT id,value,evidence_id FROM person_facts WHERE event_id=?"
+                " AND lot_id=? AND bidder_id=? AND field=? AND evidence_id IS ?"
+                " AND person_id IS ? ORDER BY id DESC LIMIT 1",
+                (event_id, lot_id, bidder_id, field, evidence_id, pid)).fetchone()
+            self.conn.execute(
+                "INSERT INTO confirmation_history"
+                " (event_id,lot_id,bidder_id,field,old_value,new_value,"
+                " old_evidence_id,evidence_id,action,original_candidate,person_id,"
+                " evidence_version,actor,changed_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (event_id, lot_id, bidder_id, field,
+                 previous["value"] if previous else None, encoded,
+                 previous["evidence_id"] if previous else None, evidence_id,
+                 action, original_candidate, pid, version, "本机用户", now))
+            if previous:
+                self.conn.execute(
+                    "UPDATE person_facts SET value=?,original_candidate=?,action=?,"
+                    " evidence_version=?,confirmed_at=? WHERE id=?",
+                    (encoded, original_candidate, action, version, now,
+                     previous["id"]))
+            else:
+                self.conn.execute(
+                    "INSERT INTO person_facts"
+                    " (event_id,lot_id,bidder_id,field,value,evidence_id,person_id,"
+                    " original_candidate,action,evidence_version,confirmed_at)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (event_id, lot_id, bidder_id, field, encoded, evidence_id,
+                     pid, original_candidate, action, version, now))
+
+    def confirm_amount(self, event_id: str, lot_id: str, bidder_id: str,
+                       raw_value, unit: str, currency: str,
+                       tax_included, evidence_id: str | None,
+                       action: str = "confirm",
+                       original_candidate: str | None = None) -> dict:
+        """金额、来源单位、币种和税口径在同一 SQLite 事务中确认。"""
+        from .money import normalize_confirmed_amount
+
+        if not all(isinstance(x, str) and x.strip()
+                   for x in (event_id, lot_id, bidder_id)):
+            return {"ok": False, "error": "event_id/lot_id/bidder_id 必填"}
+        if action not in ("confirm", "correct", "unknown"):
+            return {"ok": False, "error": "金额操作只接受 confirm/correct/unknown"}
+        if action == "unknown":
+            values = (("total_price", "unknown"), ("amount_unit", "unknown"),
+                      ("currency", "unknown"), ("tax_included", "unknown"))
+            evidence_id = None
+        else:
+            if evidence_id is None or not self.evidence_usable(evidence_id):
+                return {"ok": False, "error": "总报价缺少可回指的有效证据"}
+            currency = str(currency or "unknown").strip().upper()
+            if currency == "USD":
+                return {"ok": False,
+                        "error": "当前版本不做外币汇率换算，请核实后标为 unknown"}
+            if currency not in ("CNY", "UNKNOWN"):
+                return {"ok": False, "error": "当前版本只支持人民币金额筛查"}
+            try:
+                amount = normalize_confirmed_amount(raw_value, unit)
+            except (ValueError, TypeError) as exc:
+                return {"ok": False, "error": str(exc)}
+            currency = currency.lower() if currency == "UNKNOWN" else currency
+            if not (type(tax_included) is bool
+                    or tax_included in ("unknown", None)):
+                return {"ok": False, "error": "税口径须为含税、不含税或 unknown"}
+            tax_value = "unknown" if tax_included in ("unknown", None) else tax_included
+            values = (("total_price", amount), ("amount_unit", unit),
+                      ("currency", currency), ("tax_included", tax_value))
+        if original_candidate is not None and not isinstance(original_candidate, str):
+            return {"ok": False, "error": "original_candidate 必须是字符串"}
+        with self.conn:
+            for field, value in values:
+                self._write_confirmation(
+                    event_id, lot_id, bidder_id, field, value, evidence_id,
+                    "unknown", original_candidate, action)
+        return {"ok": True}
+
+    @_locked
+    def bind_file(self, event_id: str, lot_id: str, bidder_id: str,
+                  sha256: str, context: str, source_type: str,
+                  declared_owner_id: str | None = None,
+                  declared_uscc: str | None = None) -> dict:
+        """人工绑定来源文件至投标人，并保留文件属性供 R001/R006 复核。"""
+        allowed_contexts = {
+            "bid_document", "tenderer_document", "legal_performance",
+            "joint_venture_reference", "other",
+        }
+        if not all(isinstance(x, str) and x.strip()
+                   for x in (event_id, lot_id, bidder_id)):
+            return {"ok": False, "error": "event_id/lot_id/bidder_id 必填"}
+        if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
+            return {"ok": False, "error": "文件 SHA-256 格式错误"}
+        if context not in allowed_contexts:
+            return {"ok": False, "error": "文件用途不在允许范围内"}
+        if not isinstance(source_type, str) or not source_type.strip() \
+                or len(source_type) > 64:
+            return {"ok": False, "error": "来源类型必填且不得超过 64 字"}
+        evidence = self.conn.execute(
+            "SELECT evidence_id FROM evidence_store WHERE sha256=?"
+            " ORDER BY ordinal LIMIT 1", (sha256,)).fetchone()
+        if evidence is None or not self.evidence_usable(evidence["evidence_id"]):
+            return {"ok": False, "error": "该文件没有可回指的有效证据"}
+        owner = str(declared_owner_id).strip() if declared_owner_id else None
+        uscc = str(declared_uscc).strip() if declared_uscc else None
+        now = _now()
+        old = self.conn.execute(
+            "SELECT context,source_type,declared_owner_id,declared_uscc"
+            " FROM file_bindings WHERE event_id=? AND lot_id=? AND bidder_id=?"
+            " AND sha256=?",
+            (event_id, lot_id, bidder_id, sha256)).fetchone()
+        old_value = dict(old) if old else None
+        new_value = {"context": context, "source_type": source_type.strip(),
+                     "declared_owner_id": owner, "declared_uscc": uscc}
+        if old_value == new_value:
+            return {"ok": True, "unchanged": True}
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO file_binding_history"
+                " (event_id,lot_id,bidder_id,sha256,old_value,new_value,changed_at)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (event_id, lot_id, bidder_id, sha256,
+                 json.dumps(old_value, ensure_ascii=False) if old_value else None,
+                 json.dumps(new_value, ensure_ascii=False), now))
+            self.conn.execute(
+                "INSERT INTO file_bindings"
+                " (event_id,lot_id,bidder_id,sha256,context,source_type,"
+                " declared_owner_id,declared_uscc,created_at,updated_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(event_id,lot_id,bidder_id,sha256) DO UPDATE SET"
+                " context=excluded.context,source_type=excluded.source_type,"
+                " declared_owner_id=excluded.declared_owner_id,"
+                " declared_uscc=excluded.declared_uscc,updated_at=excluded.updated_at",
+                (event_id, lot_id, bidder_id, sha256, context,
+                 source_type.strip(), owner, uscc, now, now))
         return {"ok": True}
 
     # ------------------------------------------------------------ 组装与筛查
@@ -646,7 +1215,9 @@ class Workbench:
     def build_p2_facts(self) -> dict:
         """从确认字段组装 P2 schema 归一化事实（含证据注册表）。"""
         rows = [dict(r) for r in self.conn.execute(
-            "SELECT * FROM confirmations ORDER BY id")]
+            "SELECT * FROM confirmations WHERE field NOT IN"
+            " ('contact_phone','contact_email','bank_account','person_manager',"
+            " 'person_tech','authorize_rep','legal_rep','id_number') ORDER BY id")]
         events = {}
         evidence = {}
 
@@ -670,6 +1241,27 @@ class Workbench:
                 return json.loads(raw)
             except (TypeError, ValueError):
                 return raw
+
+        person_rows = [dict(r) for r in self.conn.execute(
+            "SELECT * FROM person_facts WHERE action IN ('confirm','correct')"
+            " ORDER BY id")]
+        person_ids = {}
+        for r in person_rows:
+            if r["field"] == "id_number" and r.get("person_id"):
+                id_number = val(r["value"])
+                if id_number != "unknown":
+                    person_ids[(r["event_id"], r["lot_id"], r["bidder_id"],
+                                r["person_id"])] = id_number
+
+        def get_bid(event_id, lot_id, bidder_id):
+            event = events.setdefault(event_id, {
+                "event_id": event_id, "project_id": event_id,
+                "event_name": event_id, "lots": {}})
+            lot = event["lots"].setdefault(lot_id, {
+                "lot_id": lot_id, "lot_name": lot_id, "bids": {}})
+            return lot["bids"].setdefault(bidder_id, {
+                "bidder_id": bidder_id, "bidder_name": bidder_id,
+                "role": "bidder", "outcome": {"status": "unknown"}})
 
         for r in rows:
             event_id, lot_id, bidder_id = r["event_id"], r["lot_id"], r["bidder_id"]
@@ -710,28 +1302,86 @@ class Workbench:
             elif field == "outcome_result":
                 st = "known" if str(value) in ("won", "lost") else "unknown"
                 bid["outcome"] = {"status": st,
-                                  "result": str(value) if st == "known" else None}
-            elif field in ("contact_phone", "contact_email", "bank_account"):
-                # 来源角色由操作人确认时显式选择（默认 unknown）：
-                # 只有显式 "bidder" 才会参与 R002 交叉，代理/平台/公共
-                # 电话不因确认数值而误报。账户映射为 kind="account"，
-                # 同样纳入 R002 账户交叉筛查
-                contacts = bid.setdefault("contacts", [])
-                kind = {"contact_phone": "phone",
-                        "contact_email": "email",
-                        "bank_account": "account"}[field]
-                contacts.append({"kind": kind, "value": str(value),
-                                 "source_role": r.get("source_role")
-                                 or "unknown",
-                                 "evidence": ev_json(ev_id)})
-            elif field in ("person_manager", "person_tech",
-                           "authorize_rep", "legal_rep"):
-                persons = bid.setdefault("persons", [])
-                persons.append({"person_id": f"{bidder_id}:{field}:{value}",
-                                "name": str(value), "id_number": "unknown",
-                                "role": field, "evidence": ev_id})
-            # 其余字段（project_name/code、lot_name、id_number 等）当前仅
+                                  "result": str(value) if st == "known" else None,
+                                  **({"evidence": ev_id} if ev_id else {})}
+            elif field == "price_lines" and isinstance(value, list):
+                bid.setdefault("price_lines", []).extend(value)
+            # 其余字段（project_name/code、lot_name 等）当前仅
             # 留档展示，不映射进 P2 规则事实
+
+        for r in person_rows:
+            if r["field"] not in ("person_manager", "person_tech",
+                                  "authorize_rep", "legal_rep"):
+                continue
+            value = val(r["value"])
+            if value == "unknown":
+                continue
+            bid = get_bid(r["event_id"], r["lot_id"], r["bidder_id"])
+            ev_id = ev_json(r["evidence_id"])
+            pid = r.get("person_id") or (
+                f"unverified:{r['bidder_id']}:{r['field']}:{ev_id or value}")
+            bid.setdefault("persons", []).append({
+                "person_id": pid, "name": str(value),
+                "id_number": str(person_ids.get((r["event_id"], r["lot_id"],
+                                                  r["bidder_id"], pid), "unknown")),
+                "role": r["field"], "evidence": ev_id})
+        for r in person_rows:
+            if r["field"] != "id_number" or not r.get("person_id"):
+                continue
+            value = val(r["value"])
+            bid = get_bid(r["event_id"], r["lot_id"], r["bidder_id"])
+            if not any(p["person_id"] == r["person_id"]
+                       for p in bid.get("persons", [])):
+                bid.setdefault("persons", []).append({
+                    "person_id": r["person_id"], "name": "unknown",
+                    "id_number": str(value), "role": "identity_reference",
+                    "evidence": ev_json(r["evidence_id"])})
+
+        # 多值联系方式按每条证据独立保留；重复确认一条来源会更新该条，不覆盖同主体的其他号码。
+        for r in self.conn.execute("SELECT * FROM contact_facts ORDER BY id"):
+            if r["action"] not in ("confirm", "correct") or r["value"] == "unknown":
+                continue
+            bid = get_bid(r["event_id"], r["lot_id"], r["bidder_id"])
+            kind = {"contact_phone": "phone", "contact_email": "email",
+                    "bank_account": "account"}[r["field"]]
+            bid.setdefault("contacts", []).append({
+                "kind": kind, "value": r["value"],
+                "source_role": r["source_role"] or "unknown",
+                "evidence": ev_json(r["evidence_id"]),
+            })
+
+        # 文件必须先由人工绑定到事件/标段/投标人，才进入主体混用和元数据筛查。
+        for binding in self.conn.execute("SELECT * FROM file_bindings ORDER BY id"):
+            bid = get_bid(binding["event_id"], binding["lot_id"],
+                          binding["bidder_id"])
+            src = self.conn.execute(
+                "SELECT first_ref,metadata_json FROM sources WHERE sha256=?",
+                (binding["sha256"],)).fetchone()
+            evrow = self.conn.execute(
+                "SELECT evidence_id FROM evidence_store WHERE sha256=?"
+                " ORDER BY ordinal LIMIT 1", (binding["sha256"],)).fetchone()
+            if src is None or evrow is None:
+                continue
+            try:
+                metadata = json.loads(src["metadata_json"] or "{}")
+            except ValueError:
+                metadata = {}
+            metadata = {
+                "producer": metadata.get("producer") or "unknown",
+                "creation_date": (metadata.get("creation_date")
+                                  or metadata.get("creationDate")
+                                  or metadata.get("created") or "unknown"),
+            }
+            bid.setdefault("files", []).append({
+                "file_ref": self.display_name_for(binding["sha256"]) or src["first_ref"],
+                "sha256": binding["sha256"],
+                "source_type": binding["source_type"],
+                "context": binding["context"],
+                "declared_owner_id": binding["declared_owner_id"],
+                "declared_uscc": binding["declared_uscc"],
+                "metadata": metadata,
+                "evidence": ev_json(evrow["evidence_id"]),
+            })
 
         out_events = []
         for event_id in sorted(events):
@@ -762,9 +1412,13 @@ class Workbench:
 
     @_locked
     def run_screen(self) -> dict:
-        """内存 FactBase 筛查（finding 随当前确认事实变化）+ P2 store
-        事件累计（同确认集幂等、内容变化冲突可见）。"""
+        """运行规则并追加不可变事实快照、规则状态与结果。"""
+        import hashlib
+
         facts = self.build_p2_facts()
+        facts_json = json.dumps(facts, ensure_ascii=False, sort_keys=True,
+                                separators=(",", ":"))
+        facts_sha256 = hashlib.sha256(facts_json.encode("utf-8")).hexdigest()
         outcome = screen_all(FactBase.from_dict(facts))
         # 复用 P2 store.connect 做 schema 初始化（裸连接会缺表）
         p2_conn = p2_store.connect(os.path.join(self.root, "p2_events.sqlite3"))
@@ -775,18 +1429,36 @@ class Workbench:
         finally:
             p2_conn.close()
         now = _now()
-        self.conn.execute(
-            "INSERT INTO findings_log(run_at, findings_json) VALUES(?,?)",
-            (now, json.dumps(outcome["findings"], ensure_ascii=False)))
-        self.conn.execute(
-            "INSERT OR REPLACE INTO meta VALUES('last_screen_at', ?)", (now,))
-        self.conn.commit()
-        return {
-            "findings": outcome["findings"],
-            "summary": outcome["summary"],
-            "excluded_facts": outcome["excluded_facts"],
-            "unresolved_evidence": outcome["unresolved_evidence"],
-            "import": {**import_result.as_dict(),
-                       "event_count_after": event_count},
-            "disclaimer": outcome["disclaimer"],
-        }
+        result = {**outcome,
+                  "import": {**import_result.as_dict(),
+                             "event_count_after": event_count}}
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO findings_log(run_at, findings_json) VALUES(?,?)",
+                (now, json.dumps(outcome["findings"], ensure_ascii=False)))
+            self.conn.execute(
+                "INSERT INTO screen_runs(run_at,rules_version,facts_sha256,"
+                "facts_json,outcome_json,status,error) VALUES(?,?,?,?,?,'completed',NULL)",
+                (now, RULE_VERSION, facts_sha256, facts_json,
+                 json.dumps(result, ensure_ascii=False, default=str)))
+            self.conn.execute(
+                "INSERT OR REPLACE INTO meta VALUES('last_screen_at', ?)", (now,))
+        return result
+
+    @_locked
+    def record_screen_failure(self, error: str) -> None:
+        """保留筛查失败状态，避免旧结果被误认为本次成功结果。"""
+        import hashlib
+
+        now = _now()
+        facts_json = "{}"
+        outcome = {"run_status": "failed", "rule_statuses": {},
+                   "error": str(error)[:1000]}
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO screen_runs(run_at,rules_version,facts_sha256,"
+                "facts_json,outcome_json,status,error) VALUES(?,?,?,?,?,'failed',?)",
+                (now, RULE_VERSION,
+                 hashlib.sha256(facts_json.encode("utf-8")).hexdigest(),
+                 facts_json, json.dumps(outcome, ensure_ascii=False),
+                 str(error)[:1000]))

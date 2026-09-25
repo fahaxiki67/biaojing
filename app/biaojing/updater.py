@@ -11,6 +11,8 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import stat
+import subprocess
+import sys
 import tempfile
 import threading
 from urllib.parse import urlsplit
@@ -89,6 +91,15 @@ def _pending(root: Path) -> dict | None:
     path = root / ".biaojing-update-staging" / "pending.json"
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _rejected_update(root: Path) -> dict | None:
+    try:
+        value = json.loads((root / ".biaojing-update-rejected.json").read_text(
+            encoding="utf-8"))
         return value if isinstance(value, dict) else None
     except (OSError, ValueError):
         return None
@@ -208,6 +219,11 @@ def check_and_stage_update(repository: str | None = None) -> dict:
         tag = release["tag_name"]
         latest = version_key(tag)
         current = version_key(VERSION)
+        rejected = _rejected_update(root)
+        if rejected and rejected.get("version") == tag and latest > current:
+            return {"status": "rejected", "current_version": VERSION,
+                    "latest_version": tag,
+                    "reason": rejected.get("reason", "兼容性检查失败")}
         pending = _pending(root)
         if pending and pending.get("version") == tag and latest > current:
             return {"status": "staged", "current_version": VERSION,
@@ -246,7 +262,7 @@ def check_and_stage_update(repository: str | None = None) -> dict:
 
 
 def apply_pending_update(project_root: str | Path | None = None) -> str | None:
-    """Atomically swap only app/biaojing; caller must restart the process."""
+    """Swap the package, import-check it, and restore the prior version on failure."""
     root = Path(project_root) if project_root is not None else _project_root()
     staging = root / ".biaojing-update-staging"
     pending = _pending(root)
@@ -271,11 +287,51 @@ def apply_pending_update(project_root: str | Path | None = None) -> str | None:
     os.replace(target, backup)
     try:
         os.replace(source, target)
-    except OSError:
-        os.replace(backup, target)
+        modules = ("pdf_parser", "docx_parser", "xlsx_parser", "money",
+                   "candidates", "rules", "workspace", "webapp", "cli",
+                   "updater")
+        missing = [name for name in modules
+                   if not (target / f"{name}.py").is_file()]
+        if missing:
+            raise UpdateError("更新包缺少关键模块：" + ", ".join(missing))
+        smoke = (
+            "import importlib,pathlib,sys\n"
+            "package=pathlib.Path(sys.argv[1]);"
+            "sys.path.insert(0,str(package.parent));sys.dont_write_bytecode=True\n"
+            "for p in package.rglob('*.py'):"
+            "compile(p.read_text(encoding='utf-8'),str(p),'exec')\n"
+            "for n in " + repr(modules) + ": importlib.import_module('biaojing.'+n)\n"
+        )
+        env = os.environ.copy()
+        package_parent = str(root / "app")
+        existing = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = (package_parent + os.pathsep + existing
+                             if existing else package_parent)
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", smoke, str(target)],
+                cwd=root, env=env, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise UpdateError(f"更新兼容性检查未完成：{exc}") from exc
+        if result.returncode:
+            detail = (result.stderr or result.stdout or "未返回错误详情").strip()
+            raise UpdateError("更新兼容性检查失败：" + detail[-1200:])
+    except Exception as exc:
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+        if backup.exists():
+            os.replace(backup, target)
+        reason = str(exc)[:1200]
+        (root / ".biaojing-update-rejected.json").write_text(
+            json.dumps({"version": tag, "reason": reason},
+                       ensure_ascii=False), encoding="utf-8")
+        shutil.rmtree(staging, ignore_errors=True)
         raise
     shutil.rmtree(staging, ignore_errors=True)
     shutil.rmtree(backup, ignore_errors=True)
+    rejected_path = root / ".biaojing-update-rejected.json"
+    if rejected_path.is_file() and not rejected_path.is_symlink():
+        rejected_path.unlink()
     return tag
 
 

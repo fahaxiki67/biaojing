@@ -40,6 +40,9 @@ INDEX_HTML = """<!DOCTYPE html>
  .reason{white-space:pre-line;overflow-wrap:anywhere}
  #uploadLog{white-space:pre-wrap;overflow-wrap:anywhere}
  #taskPanel{display:flex;align-items:center;gap:10px;margin-top:8px}
+ .cand details{min-width:220px}.cand textarea{width:230px;min-height:48px}
+ .ruleStatus{border:1px solid #edf0f3;border-radius:5px;padding:8px;margin:5px 0}
+ .finding{overflow-wrap:anywhere}
 </style>
 </head>
 <body>
@@ -50,6 +53,10 @@ INDEX_HTML = """<!DOCTYPE html>
 
 <section>
 <h2>一、拖入资料（支持目录 / ZIP / 多文件）</h2>
+<label>资料来源 <select id="sourceType"><option value="unknown">待核</option>
+<option value="bid_document">投标文件</option><option value="tenderer_document">采购人文件</option>
+<option value="agency_document">代理机构文件</option><option value="historical_record">历史资料</option>
+<option value="other">其他</option></select></label>
 <div id="drop">将整个资料目录或文件拖到这里，或点击选择文件
 <input id="file" type="file" multiple hidden>
 <input id="dir" type="file" webkitdirectory multiple hidden>
@@ -84,7 +91,9 @@ INDEX_HTML = """<!DOCTYPE html>
 <table><thead><tr>
 <th>字段</th><th>候选值</th><th>来源定位</th><th>说明</th><th>操作</th></tr></thead>
 <tbody id="cands"></tbody></table>
+<p id="candPage" class="dim"></p><button id="moreCandidates" class="ghost" hidden>加载更多候选</button>
 <p id="confCount" class="dim"></p>
+<details><summary>查看确认历史（最近100条）</summary><div id="confHistory"></div></details>
 </section>
 
 <section>
@@ -135,6 +144,7 @@ $("#checkUpdate").addEventListener("click",async()=>{
     status.textContent=result.status==="unconfigured"
       ?"自动更新尚未配置 GitHub 仓库。"
       :result.status==="current"?"当前已是最新版本（"+result.current_version+"）。"
+      :result.status==="rejected"?"版本 "+result.latest_version+" 曾未通过兼容检查；当前程序已回退，等待修复版发布。"
       :"已下载并校验版本 "+result.latest_version+"；下次启动时自动安装。";
   }catch(err){status.textContent="更新检查失败："+err.message+"。当前版本仍可使用。"}
   finally{button.disabled=false}
@@ -157,7 +167,7 @@ async function waitForJob(jobId,label){
     const job=await api("/api/jobs/"+jobId);
     meter.max=Math.max(1,job.total_pages||1);
     meter.value=Math.max(0,(job.page||0)-(job.stage==="processing"?1:0));
-    const unit=job.kind==="docx_upload"?"张图片":"页";
+    const unit=job.kind==="docx_upload"?"张图片":job.kind==="zip_upload"?"个归档成员":"页";
     const page=job.total_pages?"第 "+(job.page||0)+" / "+job.total_pages+" "+unit:"准备处理中";
     const stage=job.cancel_requested?"取消将在当前处理项完成后生效":
       job.stage==="processing"?"正在识别":job.stage==="page_done"?"页面已处理":job.stage;
@@ -277,7 +287,8 @@ async function uploadFiles(list,errors){
     attempted++;
     log.textContent+="上传中（"+attempted+"/"+total+"）："+relPath+" …\\n";
     try{
-      const r=await fetch("/api/upload?name="+encodeURIComponent(relPath),{method:"POST",body:f});
+      const r=await fetch("/api/upload?name="+encodeURIComponent(relPath)
+        +"&source_type="+encodeURIComponent($("#sourceType").value),{method:"POST",body:f});
       let j=await r.json();
       if(!r.ok) throw new Error(j.error||("HTTP "+r.status));
       if(j.job_id){
@@ -303,8 +314,14 @@ async function uploadFiles(list,errors){
 }
 
 // ---- 状态与覆盖率 ----
-async function loadState(){
-  const st=await api("/api/state");
+let candidateOffset=0,candidateState=null;
+async function loadState(append=false){
+  const offset=append?candidateOffset:0;
+  const st=await api("/api/state?candidate_offset="+offset+"&candidate_limit=200");
+  const pageCount=st.candidates.length;
+  if(append&&candidateState){st.candidates=[...candidateState.candidates,...st.candidates]}
+  candidateState=st;
+  candidateOffset=offset+pageCount;
   const cov=st.coverage, by=cov.by_status, tb=$("#coverage tbody");
   tb.textContent="";
   const tr=el("tr");tb.appendChild(tr);
@@ -347,113 +364,212 @@ async function loadState(){
       });
       action.appendChild(retry);
     }else action.appendChild(el("span","—","dim"));
+    if(s.sha256){
+      const bind=el("button","绑定到当前主体","ghost");
+      bind.addEventListener("click",()=>bindFile(s));
+      action.appendChild(bind);
+    }
     tr3.appendChild(action);
     srcTb.appendChild(tr3);
   }
-  renderCands(st);renderConfirms(st);
-  if(st.findings) renderFindings({findings: st.findings});
+  renderCands(st);renderConfirms(st);renderHistory(st);
+  const last=st.last_screen_run||{status:"not_run"};
+  if(last.status==="completed"){
+    const imported=last.import||{};
+    $("#screenMeta").textContent="最近运行 "+(last.run_at||"时间未知")
+      +"；规则 "+(last.rules_version||"未知")
+      +"；事实快照 SHA-256 "+(last.facts_sha256||"未记录")
+      +(imported.event_count_after!=null?"；累计事件 "+imported.event_count_after:"");
+  }else if(last.status==="failed"){
+    $("#screenMeta").textContent="最近一次筛查失败："+(last.error||"详情未记录");
+  }else{$("#screenMeta").textContent="尚未运行筛查"}
+  if(st.last_screen_run.status==="not_run")
+    renderFindings({run_status:"not_run",findings:[]});
+  else renderFindings({run_status:st.last_screen_run.status,
+    error:st.last_screen_run.error,rule_statuses:st.last_screen_run.rule_statuses,
+    findings:st.findings||[]});
 }
+function option(sel,value,label){const o=el("option",label);o.value=value;sel.appendChild(o)}
 function renderCands(st){
   const tb=$("#cands");tb.textContent="";
-  if(!st.candidates.length){const tr=el("tr");const td=el("td","暂无候选（先拖入资料）","dim");td.colSpan=5;tr.appendChild(td);tb.appendChild(tr);return}
+  $("#candPage").textContent="已显示 "+st.candidates.length+" / "+st.candidate_total+" 条候选";
+  $("#moreCandidates").hidden=!st.candidate_has_more;
+  if(!st.candidates.length){const tr=el("tr");const td=el("td",st.candidate_total?"本页没有候选":"暂无候选（先拖入资料）","dim");td.colSpan=5;tr.appendChild(td);tb.appendChild(tr);return}
   const CONTACT_FIELDS=new Set(["contact_phone","contact_email","bank_account"]);
+  const PERSON_FIELDS=new Set(["person_manager","person_tech","authorize_rep","legal_rep","id_number"]);
   const ROLES=["unknown","bidder","tenderer","agency","platform","public_service"];
   for(const c of st.candidates){
-    const tr=el("tr","","cand");
-    tr.appendChild(el("td",c.field));
-    const v=typeof c.value==="object"?JSON.stringify(c.value):String(c.value);
-    tr.appendChild(el("td",v.slice(0,60)));
-    tr.appendChild(el("td",c.locator_display,"dim"));
+    const tr=el("tr","","cand");tr.appendChild(el("td",c.field));
+    let display=typeof c.value==="object"?JSON.stringify(c.value):String(c.value);
+    if(c.field==="total_price"&&c.value&&typeof c.value==="object")
+      display=c.value.raw+"；金额状态："+c.value.status+(c.value.amount_yuan?"；标准金额 "+c.value.amount_yuan+" 元":"");
+    if(c.field==="price_lines"&&Array.isArray(c.value))
+      display="按主体汇总的 "+c.value.length+" 条清单报价行；请展开逐项核对";
+    tr.appendChild(el("td",display));tr.appendChild(el("td",c.locator_display,"dim"));
     tr.appendChild(el("td",c.note||"","dim"));
     const td=el("td");
     const mk=(label,cls,fn)=>{const b=el("button",label,cls);b.addEventListener("click",fn);return b};
-    const fix=document.createElement("input");fix.placeholder="改为";fix.style.width="110px";fix.dataset.cid=c.id;
+    let fix;
+    if(c.field==="price_lines"){
+      const details=el("details"),summary=el("summary","查看 / 编辑全部报价行");
+      fix=document.createElement("textarea");fix.value=JSON.stringify(c.value,null,2);fix.dataset.cid=c.id;
+      details.appendChild(summary);details.appendChild(fix);td.appendChild(details);
+    }else{
+      fix=document.createElement("input");fix.placeholder="更正值";fix.style.width="120px";fix.dataset.cid=c.id;
+      if(c.field==="total_price"&&c.value)fix.value=c.value.raw||"";
+      else if(typeof c.value==="string")fix.value=c.value;
+      td.appendChild(fix);
+    }
     td.appendChild(mk("查看证据","ghost",()=>showEv(c.evidence_id)));
-    td.appendChild(mk("确认","",()=>doConfirm(c,"confirm",null,null)));
-    td.appendChild(fix);
-    td.appendChild(mk("更正","ghost",()=>doConfirm(c,"correct",fix.value,null)));
-    td.appendChild(mk("标unknown","ghost",()=>doConfirm(c,"unknown",null,null)));
+    td.appendChild(mk("确认","",()=>doConfirm(c,"confirm",null)));
+    td.appendChild(mk("更正","ghost",()=>doConfirm(c,"correct",fix.value)));
+    td.appendChild(mk("标 unknown","ghost",()=>doConfirm(c,"unknown",null)));
     if(CONTACT_FIELDS.has(c.field)){
-      const sel=document.createElement("select");
-      sel.dataset.cid=c.id;sel.className="roleSel";sel.title="来源角色（确认值≠确认角色）";
-      for(const r of ROLES){const o=document.createElement("option");o.value=r;o.textContent="角色:"+r;sel.appendChild(o)}
-      td.appendChild(sel);
+      const sel=document.createElement("select");sel.dataset.cid=c.id;sel.className="roleSel";
+      sel.title="只有明确归属投标人的联系方式才参与 R002";
+      for(const r of ROLES)option(sel,r,"来源角色："+r);td.appendChild(sel);
+    }
+    if(PERSON_FIELDS.has(c.field)){
+      const person=document.createElement("input");person.dataset.cid=c.id;person.className="personSel";
+      person.placeholder="人工确认身份 ID；同一人跨主体填写相同值";person.style.width="190px";
+      td.appendChild(person);
     }
     if(c.field==="total_price"){
-      const sel=document.createElement("select");
-      sel.dataset.cid=c.id;sel.className="taxSel";sel.title="税口径（unknown 不参与集中度统计）";
-      for(const r of [["unknown","税口径:unknown"],["true","税口径:含税"],["false","税口径:不含税"]]){
-        const o=document.createElement("option");o.value=r[0];o.textContent=r[1];sel.appendChild(o)}
-      td.appendChild(sel);
+      const unit=document.createElement("select");unit.dataset.cid=c.id;unit.className="unitSel";unit.title="金额单位";
+      for(const p of [["unknown","单位：待核"],["yuan","元"],["ten_thousand_yuan","万元"]])option(unit,p[0],p[1]);
+      if(c.value&&["yuan","ten_thousand_yuan"].includes(c.value.unit_hint))unit.value=c.value.unit_hint;
+      const currency=document.createElement("select");currency.dataset.cid=c.id;currency.className="currencySel";currency.title="币种";
+      for(const p of [["unknown","币种：待核"],["CNY","人民币 CNY"],["USD","美元 USD"]])option(currency,p[0],p[1]);
+      currency.value=c.currency_hint||c.value.currency_hint||"unknown";
+      const tax=document.createElement("select");tax.dataset.cid=c.id;tax.className="taxSel";tax.title="税口径";
+      for(const p of [["unknown","税口径：待核"],["true","含税"],["false","不含税"]])option(tax,p[0],p[1]);
+      td.appendChild(unit);td.appendChild(currency);td.appendChild(tax);
     }
-    tr.appendChild(td);
-    tb.appendChild(tr);
+    tr.appendChild(td);tb.appendChild(tr);
   }
 }
-async function doConfirm(cand,action,fixValue,unused){
+$("#moreCandidates").addEventListener("click",()=>loadState(true));
+async function doConfirm(cand,action,fixValue){
   const eid=$("#eid").value.trim(),lid=$("#lid").value.trim(),bid=$("#bid").value.trim();
-  if(!eid||!lid||!bid){toast("请先填写事件/标段/主体 ID");return}
+  if(!eid||!lid||!bid){toast("请先填写事件 / 标段 / 主体 ID");return}
+  const original=JSON.stringify(cand.value);
+  if(cand.field==="total_price"){
+    const unitSel=document.querySelector('.unitSel[data-cid="'+cand.id+'"]');
+    const currencySel=document.querySelector('.currencySel[data-cid="'+cand.id+'"]');
+    const taxSel=document.querySelector('.taxSel[data-cid="'+cand.id+'"]');
+    const r=await fetch("/api/confirm_amount",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({event_id:eid,lot_id:lid,bidder_id:bid,
+        raw_value:action==="unknown"?null:action==="correct"?fixValue:cand.value.raw,
+        unit:action==="unknown"?"unknown":unitSel.value,
+        currency:action==="unknown"?"unknown":currencySel.value,
+        tax_included:action==="unknown"?"unknown":taxSel.value==="unknown"?"unknown":taxSel.value==="true",
+        evidence_id:cand.evidence_id,action,original_candidate:original})});
+    const j=await r.json();if(!r.ok||!j.ok){toast(j.error||"金额确认失败");return}
+    toast(action==="unknown"?"总报价及其单位、币种、税口径已标为 unknown":"金额、单位、币种和税口径已原子保存");
+    await loadState();return;
+  }
   let value=cand.value;
   if(action==="correct"){
     if(!fixValue){toast("请输入更正值");return}
-    const n=Number(String(fixValue).replace(/,/g,""));
-    value=cand.field==="total_price"&&Number.isFinite(n)?n:fixValue;
+    if(cand.field==="price_lines"){
+      try{value=JSON.parse(fixValue)}catch(_){toast("报价行 JSON 格式有误");return}
+    }else value=fixValue;
   }
-  const sel=document.querySelector('.roleSel[data-cid="'+cand.id+'"]');
-  const sourceRole=sel?sel.value:"unknown";
-  const r=await fetch("/api/confirm",{method:"POST",
-    headers:{"Content-Type":"application/json"},
+  const roleSel=document.querySelector('.roleSel[data-cid="'+cand.id+'"]');
+  const personSel=document.querySelector('.personSel[data-cid="'+cand.id+'"]');
+  const r=await fetch("/api/confirm",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({event_id:eid,lot_id:lid,bidder_id:bid,field:cand.field,
       value,evidence_id:cand.evidence_id,action,
-      source_role:sourceRole,
-      original_candidate:String(cand.value)})});
-  const j=await r.json();
-  if(!j.ok){toast(j.error||"确认失败");return}
-  // 总报价确认联动：币种候选（由人民币/表头单位推断）与税口径一并提交
-  if(action==="confirm"&&cand.companion){
-    await fetch("/api/confirm",{method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({event_id:eid,lot_id:lid,bidder_id:bid,
-        field:cand.companion.field,value:cand.companion.value,
-        evidence_id:cand.evidence_id,action:"confirm",
-        original_candidate:String(cand.value)})});
-  }
-  if(action==="confirm"&&cand.field==="total_price"){
-    const taxSel=document.querySelector('.taxSel[data-cid="'+cand.id+'"]');
-    if(taxSel&&taxSel.value!=="unknown"){
-      await fetch("/api/confirm",{method:"POST",
-        headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({event_id:eid,lot_id:lid,bidder_id:bid,
-          field:"tax_included",value:taxSel.value==="true",
-          evidence_id:cand.evidence_id,action:"confirm",
-          original_candidate:String(cand.value)})});
-    }
-  }
-  toast(action==="unknown"?"已标 unknown":("已确认（来源角色 "+sourceRole+"）"));
-  loadState();
+      source_role:roleSel?roleSel.value:"unknown",
+      person_id:personSel&&personSel.value.trim()?personSel.value.trim():null,
+      original_candidate:original})});
+  const j=await r.json();if(!r.ok||!j.ok){toast(j.error||"确认失败");return}
+  toast(action==="unknown"?"已标 unknown":"已确认；联系方式和人员身份仍按来源/人工身份分别核查");
+  await loadState();
+}
+async function bindFile(source){
+  const eid=$("#eid").value.trim(),lid=$("#lid").value.trim(),bid=$("#bid").value.trim();
+  if(!eid||!lid||!bid){toast("请先填写事件 / 标段 / 主体 ID");return}
+  const context=prompt("文件用途：bid_document / tenderer_document / legal_performance / joint_venture_reference / other","bid_document");
+  if(context===null)return;
+  const owner=prompt("文件声明主体 ID（可留空，须依据文件核对）","");if(owner===null)return;
+  const uscc=prompt("文件声明统一社会信用代码（可留空）","");if(uscc===null)return;
+  const r=await api("/api/bind_file",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({event_id:eid,lot_id:lid,bidder_id:bid,sha256:source.sha256,
+      context,source_type:source.source_type||"unknown",declared_owner_id:owner||null,declared_uscc:uscc||null})});
+  if(!r.ok){toast(r.error||"文件绑定失败");return}
+  toast("文件已绑定到当前主体；请检查用途和声明信息");await loadState();
 }
 function renderConfirms(st){
   const p=$("#confCount");
   p.textContent=st.confirmations.length
-    ? "已确认 "+st.confirmations.length+" 条字段"
+    ? "当前已确认 "+st.confirmations.length+" 项事实；历史操作 "+st.confirmation_history_total+" 条（追加保存）"
     : "已确认 0 条字段";
+}
+function renderHistory(st){
+  const box=$("#confHistory");box.textContent="";
+  const items=(st.confirmation_history||[]).map(item=>({...item,history_kind:"field"}));
+  for(const item of (st.file_binding_history||[]))items.push({
+    event_id:item.event_id,lot_id:item.lot_id,bidder_id:item.bidder_id,
+    field:"文件绑定 · "+item.sha256,action:"登记 / 修改",
+    old_value:item.old_value||"（无）",new_value:item.new_value,
+    evidence_id:item.evidence_id,changed_at:item.changed_at,history_kind:"file"});
+  items.sort((a,b)=>String(b.changed_at||"").localeCompare(String(a.changed_at||"")));
+  if(!items.length){box.appendChild(el("p","暂无确认或文件绑定历史","dim"));return}
+  box.appendChild(el("p","确认操作 "+st.confirmation_history_total
+    +" 条；文件绑定操作 "+st.file_binding_history_total+" 条（最近各 100 条）","dim"));
+  const table=el("table"),head=el("tr");
+  for(const title of ["时间","事件 / 标段 / 主体","字段","操作","原值 → 新值","证据"]){const th=el("th",title);head.appendChild(th)}
+  const thead=el("thead");thead.appendChild(head);table.appendChild(thead);
+  const body=el("tbody");
+  for(const item of items){
+    const row=el("tr"),oldv=item.old_value||"（无）",newv=item.new_value||"（无）";
+    const source=el("td");
+    for(const [label,value] of [["旧",item.old_evidence_id],["新",item.evidence_id]]){
+      if(!value)continue;
+      const link=el("span",label+":"+value,"evlink");link.addEventListener("click",()=>showEv(value));source.appendChild(link);source.appendChild(document.createTextNode(" "));
+    }
+    for(const value of [item.changed_at,item.event_id+" / "+item.lot_id+" / "+item.bidder_id,item.field,item.action,
+      String(oldv)+" → "+String(newv)])row.appendChild(el("td",value));
+    row.appendChild(source);body.appendChild(row);
+  }
+  table.appendChild(body);box.appendChild(table);
 }
 
 // ---- 筛查 ----
 $("#runScreen").addEventListener("click",async()=>{
-  const r=await fetch("/api/screen",{method:"POST",body:"{}"});
-  const j=await r.json();
-  if(!r.ok||!j.import){toast(j.error||"筛查失败，请检查已确认字段");return}
-  $("#screenMeta").textContent="事件累计 "+j.import.event_count_after+" 个，本次插入 "
-    +j.import.events_inserted+"，跳过 "+j.import.events_skipped_idempotent
-    +"，冲突 "+j.import.total_conflicts;
-  renderFindings(j);
+  $("#runScreen").disabled=true;
+  try{
+    const r=await fetch("/api/screen",{method:"POST",body:"{}"});
+    const j=await r.json();
+    if(!r.ok||!j.import){renderFindings({run_status:"failed",error:j.error||"筛查失败",findings:[]});toast(j.error||"筛查失败");await loadState();return}
+    $("#screenMeta").textContent="事件累计 "+j.import.event_count_after+" 个，本次插入 "
+      +j.import.events_inserted+"，跳过 "+j.import.events_skipped_idempotent
+      +"，冲突 "+j.import.total_conflicts;
+    renderFindings(j);await loadState();
+  }catch(err){renderFindings({run_status:"failed",error:err.message,findings:[]});toast("筛查失败："+err.message)}
+  finally{$("#runScreen").disabled=false}
 });
 function renderFindings(j){
   const box=$("#findings");box.textContent="";
+  if(j.run_status==="not_run"){
+    box.appendChild(el("p","尚未运行筛查。点击上方按钮后，系统会逐条显示可检查范围和未具备条件的规则。","dim"));return;
+  }
+  if(j.run_status==="failed"){
+    box.appendChild(el("p","本次筛查执行失败："+(j.error||"详情未返回")+"。失败状态已单独记录，之前的筛查结果不代表本次运行。","bad"));return;
+  }
+  const statuses=j.rule_statuses||{};
+  const statusLabel={findings:"发现待人工复核线索",checked_no_finding:"已检查，未发现线索",insufficient_data:"资料不足，无法完整检查"};
+  const statusBox=el("div");statusBox.appendChild(el("b","规则检查覆盖情况"));
+  for(const [id,s] of Object.entries(statuses)){
+    const text=id+" "+s.name+"："+(statusLabel[s.status]||s.status)+"（输入 "+s.input_count+" 项；线索 "+s.finding_count+" 项）"+(s.reason?"；"+s.reason:"");
+    statusBox.appendChild(el("div",text,"ruleStatus "+(s.status==="findings"?"warn":s.status==="insufficient_data"?"dim":"ok")));
+  }
+  box.appendChild(statusBox);
   const fs=j.findings||[];
-  if(!fs.length){box.appendChild(el("p","暂无筛查结果（先确认字段再运行）","dim"));return}
-  for(const f of fs){
+  const reportable=fs.filter(f=>f.signal!=="不计算");
+  if(!reportable.length){box.appendChild(el("p","筛查已完成；没有可报告的异常线索。资料不足或未具备条件的规则已在上方逐条列明。","dim"));return}
+  for(const f of reportable){
     const card=el("div","","finding");
     const head=el("div","["+f.rule_id+" · "+f.signal+"] "+f.trigger_reason,"head");
     const detail=el("div","","detail");detail.style.display="none";

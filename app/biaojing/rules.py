@@ -36,9 +36,10 @@
 
 from __future__ import annotations
 
-import statistics
-import math
 from collections import Counter, defaultdict
+from decimal import Decimal, InvalidOperation, localcontext
+
+from .money import decimal_text
 
 RULE_VERSION = "P2-1.1"
 SCHEMA = "biaojing.p2/1"
@@ -73,12 +74,24 @@ def _finite_amount(value, allow_unknown: bool = False) -> bool:
         return allow_unknown
     if allow_unknown and isinstance(value, str) and value.strip().casefold() == "unknown":
         return True
-    if type(value) not in (int, float):
+    if isinstance(value, bool):
         return False
     try:
-        return math.isfinite(float(value))
-    except (OverflowError, ValueError):
+        return Decimal(str(value)).is_finite()
+    except (InvalidOperation, TypeError, ValueError):
         return False
+
+
+def _decimal(value) -> Decimal:
+    if isinstance(value, bool):
+        raise ValueError("布尔值不是金额")
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError("金额不是有效十进制数") from exc
+    if not result.is_finite():
+        raise ValueError("金额不是有限值")
+    return result
 
 
 def _known(value) -> bool:
@@ -125,7 +138,8 @@ class Person:
 
 class PriceLine:
     __slots__ = ("item_code", "item_name", "spec", "unit", "qty",
-                 "unit_price", "currency", "tax_included", "evidence")
+                 "unit_price", "currency", "tax_included", "evidence",
+                 "field_evidence")
 
     def __init__(self, raw: dict):
         self.item_code = raw.get("item_code", "unknown")
@@ -137,6 +151,7 @@ class PriceLine:
         self.currency = raw.get("currency", "unknown")
         self.tax_included = raw.get("tax_included")
         self.evidence = raw.get("evidence")
+        self.field_evidence = raw.get("field_evidence") or {}
 
     def comparable_key(self) -> tuple:
         # 税口径三态（True/False/None=unknown）：None 不得折成 False，
@@ -337,8 +352,9 @@ def make_finding(rule_id: str, scope: dict, inputs: dict, params: dict,
 
 
 def _close(a: float, b: float) -> bool:
-    scale = max(abs(a), abs(b), 1.0)
-    return abs(a - b) <= scale * REL_TOL
+    a, b = _decimal(a), _decimal(b)
+    scale = max(abs(a), abs(b), Decimal(1))
+    return abs(a - b) <= scale * Decimal(str(REL_TOL))
 
 
 # ---------------------------------------------------------------- R001
@@ -542,19 +558,22 @@ def screen_r003(fb: FactBase, thresholds: dict) -> list[dict]:
 # ---------------------------------------------------------------- R004
 
 def detect_pattern(values: list[float]):
-    """行内模式检测：返回 ("等差", steps) / ("等比", ratios) / None。
+    """行内模式检测；金额采用十进制，完全相同与等差分开报告。
 
     等差与等比为两种独立可触发模式；等比要求全部报价为正。
     """
+    values = [_decimal(value) for value in values]
     n = len(values)
+    if n > 1 and all(value == values[0] for value in values[1:]):
+        return "完全相同", ["0"] * (n - 1)
     steps = [round(values[i + 1] - values[i], PRICE_PRECISION)
              for i in range(n - 1)]
     if steps and all(_close(s, steps[0]) for s in steps[1:]):
-        return "等差", steps
+        return "等差", [decimal_text(step) for step in steps]
     if all(v > 0 for v in values):
         ratios = [round(values[i + 1] / values[i], 8) for i in range(n - 1)]
         if ratios and all(_close(r, ratios[0]) for r in ratios[1:]):
-            return "等比", ratios
+            return "等比", [decimal_text(ratio) for ratio in ratios]
     return None
 
 
@@ -567,8 +586,9 @@ def screen_r004(fb: FactBase, thresholds: dict) -> list[dict]:
         不同可比行。
       - 清单编码已知，或名称与规格均已知；单位、币种、税口径也必须已知。
         unknown 字段不因哨兵值相同而组成可比组。
-      - 组内有效投标人 ≥3 才检测；所有行按 bidder_id 升序固定排序，
-        跨行对应关系绝不重排；精度 round(2)、相对容差 1e-6。
+      - 组内有效投标人 ≥3 才检测；以首个全体报价唯一的参考行确定主体顺序，
+        再用于同标段其他行；单行筛查按金额排序，不依赖 bidder_id；
+        精度 round(2)、相对容差 1e-6。
       - 等差与等比为两种独立模式，逐行输出模式、排序、匹配/未匹配
         分子分母与证据。
       - 同 (event_id, lot_id) 内 ≥2 行成模式且投标人排序一致 → 线索；
@@ -614,12 +634,30 @@ def screen_r004(fb: FactBase, thresholds: dict) -> list[dict]:
     pattern_rows = []   # 达门槛且呈模式的竞价组
     unmatched_no_pattern = 0            # 达门槛但无模式
     unmatched_below = 0                 # 投标人不足门槛
+    reference_orders = {}
+    for key, per_bidder in sorted(groups.items(), key=lambda kv: str(kv[0])):
+        lot_key = key[:2]
+        if len(per_bidder) < min_b or lot_key in reference_orders:
+            continue
+        prices = [_decimal(line.unit_price) for line in per_bidder.values()]
+        if len(set(prices)) == len(prices):
+            reference_orders[lot_key] = tuple(
+                bidder for bidder, _ in sorted(
+                    per_bidder.items(), key=lambda pair: _decimal(pair[1].unit_price)))
+
     for key, per_bidder in sorted(groups.items(), key=lambda kv: str(kv[0])):
         if len(per_bidder) < min_b:
             unmatched_below += 1
             continue
-        ordered = sorted(per_bidder.items(), key=lambda kv: kv[0])
-        values = [round(line.unit_price, PRICE_PRECISION)
+        reference = reference_orders.get(key[:2])
+        fixed_identity_order = bool(reference and set(reference) == set(per_bidder))
+        if fixed_identity_order:
+            ordered = [(bidder, per_bidder[bidder]) for bidder in reference]
+        else:
+            # 同价时 ID 只稳定展示顺序；只要存在价差，检测结果由价格序列决定。
+            ordered = sorted(per_bidder.items(),
+                             key=lambda pair: (_decimal(pair[1].unit_price), pair[0]))
+        values = [round(_decimal(line.unit_price), PRICE_PRECISION)
                   for _, line in ordered]
         pattern = detect_pattern(values)
         if pattern is None:
@@ -629,9 +667,11 @@ def screen_r004(fb: FactBase, thresholds: dict) -> list[dict]:
             "event_id": key[0], "lot_id": key[1],
             "comparable_key": [str(x) for x in key[2:]],
             "bidders_in_fixed_order": [b for b, _ in ordered],
-            "values": values,
+            "values": [decimal_text(value) for value in values],
             "mode": pattern[0], "steps_or_ratios": pattern[1],
             "evidence": [line.evidence for _, line in ordered],
+            "field_evidence": [line.field_evidence for _, line in ordered],
+            "identity_order_confirmed": fixed_identity_order,
         })
 
     total_groups = len(groups)          # 全部可比组
@@ -642,7 +682,8 @@ def screen_r004(fb: FactBase, thresholds: dict) -> list[dict]:
         # "跨行"只在同一 (event_id, lot_id) 内成立
         by_lot = defaultdict(list)
         for row in pattern_rows:
-            by_lot[(row["event_id"], row["lot_id"])].append(row)
+            if row["identity_order_confirmed"] and row["mode"] != "完全相同":
+                by_lot[(row["event_id"], row["lot_id"])].append(row)
         strong_lots = []
         for (event_id, lot_id), rows in sorted(by_lot.items()):
             if len(rows) >= min_rows_strong:
@@ -651,9 +692,12 @@ def screen_r004(fb: FactBase, thresholds: dict) -> list[dict]:
                     strong_lots.append((event_id, lot_id, rows))
         strong = bool(strong_lots)
         all_ev = [e for r in pattern_rows for e in r["evidence"] if e]
+        all_ev.extend(e for row in pattern_rows for field_map in row["field_evidence"]
+                      for e in field_map.values() if e and fb.usable(e))
         detail_keys = ("event_id", "lot_id", "comparable_key",
                        "bidders_in_fixed_order", "values", "mode",
-                       "steps_or_ratios")
+                       "steps_or_ratios", "evidence", "field_evidence",
+                       "identity_order_confirmed")
         findings.append(make_finding(
             "R004",
             scope={"strong_lot_groups": [
@@ -677,10 +721,11 @@ def screen_r004(fb: FactBase, thresholds: dict) -> list[dict]:
             params={"grouping": "比较组键 = event_id + lot_id + 可比键"
                                 "（不同事件/标段绝不拼组）",
                     "min_comparable_bidders": min_b,
-                    "sort": "bidder_id 升序（固定，跨行同一对应关系，禁止逐行重排）",
+                    "sort": "首个全体报价唯一的参考行按价格升序固定主体顺序；"
+                            "无参考行时仅按价格序列作弱筛查",
                     "precision": PRICE_PRECISION,
                     "tolerance": f"相对 {REL_TOL}",
-                    "modes": ["等差", "等比"],
+                    "modes": ["完全相同", "等差", "等比"],
                     "unmatched_definition": "竞价组有效投标人不足 min_comparable_bidders"},
             trigger_reason=(
                 f"{matched} 个竞价组呈行内模式（等差/等比）；"
@@ -728,11 +773,12 @@ def screen_r005(fb: FactBase, thresholds: dict) -> list[dict]:
             excluded_by_group[key].append({"bidder_id": bid.bidder_id,
                                            "reason": "报价 unknown"})
             continue
-        if not isinstance(p, (int, float)):
+        if not _finite_amount(p):
             excluded_by_group[key].append({"bidder_id": bid.bidder_id,
                                            "reason": "报价非数值"})
             continue
-        if p <= 0:
+        amount = _decimal(p)
+        if amount <= 0:
             excluded_by_group[key].append({"bidder_id": bid.bidder_id,
                                            "reason": "报价非正数"})
             continue
@@ -751,7 +797,7 @@ def screen_r005(fb: FactBase, thresholds: dict) -> list[dict]:
             excluded_by_group[key].append({"bidder_id": bid.bidder_id,
                                            "reason": "报价证据缺失/无效，不进入分母"})
             continue
-        groups[key + (bid.currency, bid.tax_included)].append((bid, float(p)))
+        groups[key + (bid.currency, bid.tax_included)].append((bid, amount))
 
     # excluded-only 组（该 event+lot 只有被排除报价）也参与"不计算"披露：
     # 合成为 (event_id, lot_id, None, None) 的虚拟口径组；若同 (event, lot)
@@ -769,7 +815,7 @@ def screen_r005(fb: FactBase, thresholds: dict) -> list[dict]:
                   if b.total_price_evidence]
         base = {"event_id": event_id, "lot_id": lot_id,
                 "currency": currency, "tax_included": tax,
-                "prices": prices,
+                "prices": [decimal_text(p) for p in prices],
                 "excluded": excluded,
                 "n_positive": len(prices), "n_min": min_n}
         if len(prices) < min_n:
@@ -787,7 +833,9 @@ def screen_r005(fb: FactBase, thresholds: dict) -> list[dict]:
                     signal="不计算",
                 ))
             continue
-        mean = statistics.fmean(prices)
+        with localcontext() as ctx:
+            ctx.prec = 32
+            mean = sum(prices, Decimal(0)) / Decimal(len(prices))
         if mean == 0:
             findings.append(make_finding(
                 "R005", scope={"event_id": event_id, "lot_id": lot_id,
@@ -800,19 +848,27 @@ def screen_r005(fb: FactBase, thresholds: dict) -> list[dict]:
             continue
         rng = max(prices) - min(prices)
         range_ratio = rng / mean
-        pstdev = statistics.pstdev(prices)
+        with localcontext() as ctx:
+            ctx.prec = 32
+            variance = sum(((p - mean) ** 2 for p in prices), Decimal(0)) \
+                / Decimal(len(prices))
+            pstdev = variance.sqrt()
         cv = pstdev / mean
-        if range_ratio <= th_rr or cv <= th_cv:
+        range_threshold = Decimal(str(th_rr))
+        cv_threshold = Decimal(str(th_cv))
+        if range_ratio <= range_threshold or cv <= cv_threshold:
             findings.append(make_finding(
                 "R005",
                 scope={"event_id": event_id, "lot_id": lot_id,
                        "currency": currency, "tax_included": tax},
                 inputs={**base,
-                        "mean": round(mean, 4), "pstdev": round(pstdev, 4),
-                        "max": max(prices), "min": min(prices)},
+                        "mean": decimal_text(round(mean, 4)),
+                        "pstdev": decimal_text(round(pstdev, 4)),
+                        "max": decimal_text(max(prices)),
+                        "min": decimal_text(min(prices))},
                 params={"formula": "极差率=(max-min)/有效报价均值；CV=总体标准差/均值",
-                        "range_ratio": round(range_ratio, 6),
-                        "cv": round(cv, 6),
+                        "range_ratio": float(round(range_ratio, 6)),
+                        "cv": float(round(cv, 6)),
                         "threshold_range_ratio_max": th_rr,
                         "threshold_cv_max": th_cv,
                         "denominator_scope": "event_id + lot_id + 币种 + 税口径"
@@ -943,7 +999,7 @@ def screen_r007(fb: FactBase, thresholds: dict) -> list[dict]:
                 reasons = []
                 for candidate, label in ((b, "本方"), (o, "中标方")):
                     price = candidate.total_price
-                    if not _finite_amount(price) or price <= 0:
+                    if not _finite_amount(price) or _decimal(price) <= 0:
                         reasons.append(f"{label}报价缺失、非正数或无效")
                     if not _known(candidate.currency):
                         reasons.append(f"{label}币种未知")
@@ -977,12 +1033,14 @@ def screen_r007(fb: FactBase, thresholds: dict) -> list[dict]:
                                f"与中标方 {o.bidder_id} 比价排除：{reason}")
                 else:
                     comparable_wins.append(o)
-            if comparable_wins and b.total_price > min(
-                    o.total_price for o in comparable_wins):
-                best = min(comparable_wins, key=lambda o: o.total_price)
+            if comparable_wins and _decimal(b.total_price) > min(
+                    _decimal(o.total_price) for o in comparable_wins):
+                best = min(comparable_wins,
+                           key=lambda o: _decimal(o.total_price))
                 above.append({"event_id": b.event_id, "lot_id": b.lot_id,
-                              "bid_price": b.total_price,
-                              "min_won_price_same_lot": best.total_price,
+                              "bid_price": decimal_text(_decimal(b.total_price)),
+                              "min_won_price_same_lot":
+                                  decimal_text(_decimal(best.total_price)),
                               "bid_price_evidence": b.total_price_evidence,
                               "won_price_evidence": best.total_price_evidence})
         if len(lost_events) < th_lost and len(above) < th_above:
@@ -1102,7 +1160,7 @@ SCREENERS = [screen_r001, screen_r002, screen_r003, screen_r004,
 
 
 def screen_all(fb: FactBase, thresholds: dict | None = None) -> dict:
-    """执行 R001—R008，返回 {findings, summary, r004_stats}。"""
+    """执行 R001—R008，并说明逐规则的检查条件与覆盖状态。"""
     fb.validate_prices()
     th = dict(DEFAULT_THRESHOLDS)
     if thresholds:
@@ -1119,9 +1177,103 @@ def screen_all(fb: FactBase, thresholds: dict | None = None) -> dict:
             findings.extend(out)
     by_rule = Counter(f["rule_id"] for f in findings)
     by_signal = Counter(f["signal"] for f in findings)
+    by_bidder = defaultdict(set)
+    for bid in fb.bids:
+        if bid.role == "bidder" and fb.usable(bid.evidence):
+            by_bidder[bid.bidder_id].add(bid.event_id)
+    pair_events = Counter()
+    by_event_bidders = defaultdict(set)
+    for bid in fb.bids:
+        if bid.role == "bidder" and fb.usable(bid.evidence):
+            by_event_bidders[bid.event_id].add(bid.bidder_id)
+    for event_bidders in by_event_bidders.values():
+        bidders = sorted(event_bidders)
+        for i, first in enumerate(bidders):
+            for second in bidders[i + 1:]:
+                pair_events[(first, second)] += 1
+    eligible = {
+        "R001": sum(1 for bid in fb.bids for file in bid.files
+                    if file.context not in R001_EXCLUDED_CONTEXTS
+                    and fb.usable(file.evidence)
+                    and (file.declared_owner_id is not None
+                         or file.declared_uscc is not None)),
+        "R002": sum(1 for bid in fb.bids for c in bid.contacts
+                    if bid.role == "bidder" and c.source_role == "bidder"
+                    and _known(c.value) and fb.usable(c.evidence)),
+        "R003": sum(1 for bid in fb.bids for person in bid.persons
+                    if person.person_id and not str(person.person_id).startswith("unverified:")
+                    and fb.usable(person.evidence)),
+        "R004": (r004_stats or {}).get("comparable_rows_matched", 0)
+                + (r004_stats or {}).get("comparable_rows_unmatched_no_pattern", 0),
+        "R005": sum(1 for bid in fb.bids if _finite_amount(bid.total_price)
+                    and _decimal(bid.total_price) > 0
+                    and _known(bid.currency) and type(bid.tax_included) is bool
+                    and fb.usable(bid.total_price_evidence)),
+        "R006": sum(1 for bid in fb.bids for file in bid.files
+                    if fb.usable(file.evidence)
+                    and any(_known(file.metadata.get(key))
+                            for key in ("producer", "creation_date"))),
+        "R007": sum(1 for bid in fb.bids if bid.outcome_status == "known"
+                    and bid.outcome_result in ("won", "lost")
+                    and fb.usable(bid.evidence)),
+        "R008": max(pair_events.values(), default=0),
+    }
+    names = {
+        "R001": "文件主体归属", "R002": "联系方式交叉",
+        "R003": "人员交叉", "R004": "清单报价规律",
+        "R005": "总报价集中", "R006": "文件属性相似",
+        "R007": "重复参投行为", "R008": "共同参投组合",
+    }
+    rule_statuses = {}
+    for rule_id, name in names.items():
+        rule_findings = [f for f in findings if f["rule_id"] == rule_id]
+        positive = [f for f in rule_findings if f["signal"] != "不计算"]
+        enough = eligible[rule_id] > 0
+        reason = ""
+        if rule_id == "R004":
+            enough = eligible[rule_id] > 0
+            reason = ("可比清单行不足 3 家或关键字段/证据不齐"
+                      if not enough else "已筛查具备可比条件的清单行")
+        elif rule_id == "R005":
+            enough = eligible[rule_id] >= th["R005"]["min_positive_bidders"]
+            reason = ("同标段已知币种、税口径和有效证据的正报价不足"
+                      if not enough else "已按标段、币种和税口径分组筛查")
+        elif rule_id == "R008":
+            enough = eligible[rule_id] >= th["R008"]["common_events_min"]
+            reason = ("可回指的共同参投事件未达到规则阈值"
+                      if not enough else "已检查达到阈值的共同参投组合")
+        elif rule_id == "R002":
+            enough = eligible[rule_id] > 0 and len({
+                bid.bidder_id for bid in fb.bids
+                if any(c.source_role == "bidder" and _known(c.value)
+                       and fb.usable(c.evidence) for c in bid.contacts)}) >= 2
+            reason = "需两个以上主体的已确认投标人联系方式" if not enough else ""
+        elif rule_id == "R003":
+            enough = eligible[rule_id] > 0 and len({
+                bid.bidder_id for bid in fb.bids
+                if any(p.person_id and not str(p.person_id).startswith("unverified:")
+                       and fb.usable(p.evidence) for p in bid.persons)}) >= 2
+            reason = "需跨两个以上主体的显式人员身份" if not enough else ""
+        elif rule_id == "R007":
+            enough = eligible[rule_id] > 0
+            reason = "缺少带有效证据的中标/未中标确认" if not enough else ""
+        elif not enough:
+            reason = "缺少可回指且已确认的规则输入"
+        rule_statuses[rule_id] = {
+            "name": name,
+            "status": ("findings" if positive else
+                       "checked_no_finding" if enough else "insufficient_data"),
+            "input_count": eligible[rule_id],
+            "finding_count": len(positive),
+            "not_calculated_count": len(rule_findings) - len(positive),
+            "reason": reason or ("发现待人工复核线索" if positive else
+                                 "已检查，未发现该规则线索"),
+        }
     return {
         "findings": findings,
         "r004_stats": r004_stats or {},
+        "rule_statuses": rule_statuses,
+        "run_status": "completed",
         "excluded_facts": list(fb.excluded_facts),
         "summary": {
             "total": len(findings),

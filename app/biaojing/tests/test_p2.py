@@ -306,6 +306,31 @@ class R004Tests(unittest.TestCase):
                   for r in fs[0]["inputs"]["rows_detail"]}
         self.assertEqual(orders, {("B1", "B2", "B3")})
 
+    def test_signal_is_invariant_to_bidder_id_renaming(self):
+        original = screen(self.three_bidder_event({
+            "B1": [100, 200, 300], "B2": [110, 210, 310],
+            "B3": [120, 220, 320]}))
+        renamed = screen(self.three_bidder_event({
+            "Z": [100, 200, 300], "A": [110, 210, 310],
+            "M": [120, 220, 320]}))
+        a, b = by_rule(original, "R004"), by_rule(renamed, "R004")
+        self.assertEqual(len(a), 1)
+        self.assertEqual(len(b), 1)
+        self.assertEqual(a[0]["signal"], b[0]["signal"])
+        self.assertEqual(a[0]["scope"]["strong_lot_groups"][0]["rows"],
+                         b[0]["scope"]["strong_lot_groups"][0]["rows"])
+        self.assertEqual(
+            [row["values"] for row in a[0]["inputs"]["rows_detail"]],
+            [row["values"] for row in b[0]["inputs"]["rows_detail"]])
+
+    def test_identical_quotes_are_reported_separately_from_price_pattern(self):
+        out = screen(self.three_bidder_event({
+            "B1": [100, 200], "B2": [100, 200], "B3": [100, 200]}))
+        finding = by_rule(out, "R004")[0]
+        self.assertEqual(finding["signal"], "弱线索")
+        self.assertEqual({row["mode"] for row in finding["inputs"]["rows_detail"]},
+                         {"完全相同"})
+
     def test_weak_single_row(self):
         out = screen(self.three_bidder_event(
             {"B1": [100], "B2": [110], "B3": [120]}))
@@ -454,7 +479,9 @@ class R005Tests(unittest.TestCase):
         self.assertAlmostEqual(fs[0]["params"]["range_ratio"], rr, places=4)
         self.assertAlmostEqual(fs[0]["params"]["cv"], cv, places=4)
         self.assertEqual(fs[0]["inputs"]["n_positive"], 3)
-        self.assertEqual(fs[0]["inputs"]["mean"], round(mean, 4))
+        from decimal import Decimal
+        self.assertEqual(Decimal(fs[0]["inputs"]["mean"]),
+                         Decimal(str(round(mean, 4))))
 
     def test_negative_dispersed(self):
         out = screen(self.one_event([80.0, 100.0, 130.0]))

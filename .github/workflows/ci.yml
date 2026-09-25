@@ -1,11 +1,13 @@
-name: 测试并发布标镜更新
+name: 跨平台自动化回归
 
 on:
   push:
-    tags: ["v*"]
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test:
@@ -36,25 +38,3 @@ jobs:
         run: python -m compileall -q app
       - name: 运行自动化回归
         run: python -W error::ResourceWarning -m unittest discover -s app/biaojing/tests -t app
-
-  publish:
-    needs: test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.ref }}
-      - name: 生成源码更新包
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: python3 scripts/build_update_bundle.py "$RELEASE_TAG"
-      - name: 校验中文版本说明并发布
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          NOTES_FILE=".github/release-notes/$RELEASE_TAG.md"
-          test -f "$NOTES_FILE"
-          gh release create "$RELEASE_TAG" --verify-tag \
-            --title "标镜 $RELEASE_TAG" --notes-file "$NOTES_FILE" \
-            "biaojing-source-$RELEASE_TAG.zip"

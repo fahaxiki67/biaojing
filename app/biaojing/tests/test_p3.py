@@ -124,7 +124,9 @@ class EvidenceIdTests(unittest.TestCase):
         b = candidates.assign_evidence_ids("ab" * 32, evs)
         self.assertEqual([e["evidence_id"] for e in a],
                          [e["evidence_id"] for e in b])
-        self.assertTrue(a[0]["evidence_id"].startswith("E-abababababab-0001"))
+        reordered = candidates.assign_evidence_ids("ab" * 32, list(reversed(evs)))
+        self.assertEqual(a[0]["evidence_id"], reordered[1]["evidence_id"])
+        self.assertTrue(a[0]["evidence_id"].startswith("E-" + "ab" * 32 + "-"))
         # 原条目不被修改（P1 locator/原文保持原样）
         self.assertNotIn("evidence_id", evs[0])
         self.assertEqual(evs[0]["locator"], "paragraph 1")
@@ -162,8 +164,8 @@ class CandidateExtractionTests(unittest.TestCase):
                       "total_price", "contact_phone"):
             self.assertIn(field, by_field, f"缺字段候选 {field}")
         tp = by_field["total_price"][0]
-        self.assertIsInstance(tp["value"], float)
-        self.assertAlmostEqual(tp["value"], 119860000.0)
+        self.assertEqual(tp["value"]["status"], "normalized")
+        self.assertEqual(tp["value"]["amount_yuan"], "119860000")
         # P2 locator 为 dict 且保留显示字符串
         self.assertIsInstance(by_field["project_name"][0]["locator"], dict)
         self.assertEqual(by_field["project_name"][0]["locator_display"],
@@ -227,6 +229,17 @@ class WorkbenchTests(unittest.TestCase):
             "SELECT evidence_id FROM candidates ORDER BY id").fetchall()
         self.assertTrue(all(r["evidence_id"].startswith(
             "E-" + r1["sha256"][:12]) for r in cands))
+
+    def test_xlsx_extraction_version_is_recorded(self):
+        from biaojing import xlsx_parser
+
+        result = self.wb.ingest_bytes("开标记录.xlsx", B01_XLSX.read_bytes())
+        self.assertEqual(result["status"], "success")
+        source = self.wb.conn.execute(
+            "SELECT extract_version FROM sources WHERE sha256=?",
+            (result["sha256"],)).fetchone()
+        self.assertEqual(source["extract_version"],
+                         xlsx_parser.EXTRACTION_VERSION)
 
     def test_confirm_requires_resolvable_evidence(self):
         data = B01_DOCX.read_bytes()
@@ -374,10 +387,9 @@ class WorkbenchTests(unittest.TestCase):
                 "SELECT evidence_id FROM candidates"
                 " WHERE field='total_price' AND evidence_id != 'E-oldsha-0001'"
                 " LIMIT 1").fetchall()
-            ok = wb.confirm_field("EV-1", "L1", "SYN-BIDDER-01",
-                                  "total_price", 119860000.0,
-                                  cands[0]["evidence_id"], "confirm",
-                                  source_role="bidder")
+            ok = wb.confirm_amount("EV-1", "L1", "SYN-BIDDER-01",
+                                   "119860000", "yuan", "CNY", True,
+                                   cands[0]["evidence_id"], "confirm")
             self.assertTrue(ok["ok"])
         finally:
             wb.close()
@@ -399,37 +411,34 @@ class WorkbenchTests(unittest.TestCase):
             "SELECT field, value_json, evidence_id FROM candidates"
             " WHERE field='total_price' LIMIT 1").fetchall()
         tp = cands[0]
-        self.wb.confirm_field("EV-1", "L1", "B1", "total_price",
-                              55.0, tp["evidence_id"], "correct",
-                              original_candidate=tp["value_json"])
+        self.wb.confirm_amount("EV-1", "L1", "B1", "55", "yuan", "CNY",
+                               "unknown", tp["evidence_id"], "correct",
+                               original_candidate=tp["value_json"])
         row = self.wb.conn.execute(
             "SELECT value, original_candidate, action FROM confirmations"
             " WHERE field='total_price'").fetchone()
-        self.assertEqual(json.loads(row["value"]), 55.0)
-        # 原始候选值（119860000.0）被保留，而非更正值
-        self.assertEqual(json.loads(row["original_candidate"]), 119860000.0)
+        self.assertEqual(json.loads(row["value"]), "55")
+        # 原始结构化候选被原样保留，而非更正值。
+        self.assertEqual(json.loads(row["original_candidate"])["amount_yuan"],
+                         "119860000")
         self.assertEqual(row["action"], "correct")
 
-    def test_cny_companion_roundtrip_and_tax_default_unknown(self):
-        # 二次验收补充：B01 投标文件的总报价候选带 CNY 币种联动候选；
-        # 未确认税口径时保持 unknown，不进入 R005 统计分母
+    def test_cny_amount_roundtrip_and_tax_default_unknown(self):
+        # 原始人民币金额与单位进入同一确认事务；税口径 unknown 不进 R005 分母。
         data = B01_DOCX.read_bytes()
         self.wb.ingest_bytes("蓝湾.docx", data)
         cands = self.wb.conn.execute(
-            "SELECT field, value_json, evidence_id, companion_json FROM"
-            " candidates WHERE field IN ('total_price','currency')"
+            "SELECT field, value_json, evidence_id, candidate_meta_json FROM"
+            " candidates WHERE field='total_price'"
             " ORDER BY id").fetchall()
-        tp = [c for c in cands if c["field"] == "total_price"][0]
-        companion = json.loads(tp["companion_json"])
-        self.assertIsNotNone(companion)
-        self.assertEqual(companion["field"], "currency")
-        self.assertEqual(companion["value"], "CNY")
-        # 币种以 total_price 的 companion 联动确认（UI 一并提交），
-        # 不产生独立候选行
-        # 仅确认总报价（不确认币种/税口径）
-        self.wb.confirm_field("EV-1", "L1", "SYN-BIDDER-01",
-                              "total_price", json.loads(tp["value_json"]),
-                              tp["evidence_id"], "confirm")
+        tp = cands[0]
+        cand_value = json.loads(tp["value_json"])
+        meta = json.loads(tp["candidate_meta_json"])
+        self.assertEqual(meta["currency_hint"], "CNY")
+        self.wb.confirm_amount("EV-1", "L1", "SYN-BIDDER-01",
+                               cand_value["raw"], cand_value["unit_hint"],
+                               meta["currency_hint"], "unknown",
+                               tp["evidence_id"], "confirm")
         result = self.wb.run_screen()
         r005 = [f for f in result["findings"] if f["rule_id"] == "R005"]
         # 税口径 unknown → 该报价被隔离，R005 不触发集中度
@@ -437,9 +446,68 @@ class WorkbenchTests(unittest.TestCase):
         # roundtrip：确认值与证据经库读回保持
         facts = self.wb.build_p2_facts()
         b1 = facts["events"][0]["lots"][0]["bids"][0]
-        self.assertEqual(b1["total_price"], 119860000.0)
+        self.assertEqual(b1["total_price"], "119860000")
         self.assertIsNone(b1.get("tax_included"))
         self.assertIsNotNone(b1["total_price_evidence"])
+
+    def test_multi_contacts_people_file_binding_and_screen_snapshot(self):
+        import hashlib
+
+        self.wb.ingest_bytes("蓝湾.docx", B01_DOCX.read_bytes())
+        sha = hashlib.sha256(B01_DOCX.read_bytes()).hexdigest()
+        evidence_ids = [r[0] for r in self.wb.conn.execute(
+            "SELECT evidence_id FROM evidence_store WHERE sha256=?"
+            " ORDER BY ordinal LIMIT 4", (sha,))]
+        self.assertEqual(len(evidence_ids), 4)
+        for value, eid in zip(("138-0000-0001", "138-0000-0002"), evidence_ids[:2]):
+            self.assertTrue(self.wb.confirm_field(
+                "EV-AUDIT", "LOT-AUDIT", "BID-A", "contact_phone", value,
+                eid, "confirm", source_role="bidder")["ok"])
+        for name, person_id, eid in (
+                ("张三", "PERSON-A", evidence_ids[2]),
+                ("李四", "PERSON-B", evidence_ids[3])):
+            self.assertTrue(self.wb.confirm_field(
+                "EV-AUDIT", "LOT-AUDIT", "BID-A", "person_manager", name,
+                eid, "confirm", person_id=person_id)["ok"])
+        self.assertTrue(self.wb.confirm_field(
+            "EV-AUDIT", "LOT-AUDIT", "BID-B", "person_tech", "张三",
+            evidence_ids[2], "confirm", person_id="PERSON-A")["ok"])
+        self.assertTrue(self.wb.confirm_field(
+            "EV-AUDIT", "LOT-AUDIT", "BID-A", "outcome_result", "未中标",
+            evidence_ids[3], "confirm")["ok"])
+        self.assertTrue(self.wb.bind_file(
+            "EV-AUDIT", "LOT-AUDIT", "BID-A", sha, "bid_document",
+            "bid_document", declared_owner_id="BID-OTHER")["ok"])
+
+        facts = self.wb.build_p2_facts()
+        stored_bid = facts["events"][0]["lots"][0]["bids"][0]
+        second_bid = facts["events"][0]["lots"][0]["bids"][1]
+        self.assertEqual(len(stored_bid["contacts"]), 2)
+        self.assertEqual({p["person_id"] for p in stored_bid["persons"]},
+                         {"PERSON-A", "PERSON-B"})
+        self.assertEqual(len(stored_bid["files"]), 1)
+        self.assertEqual(stored_bid["outcome"]["result"], "lost")
+        self.assertEqual(stored_bid["outcome"]["evidence"], evidence_ids[3])
+        self.assertEqual(second_bid["persons"][0]["person_id"], "PERSON-A")
+        screened = self.wb.run_screen()
+        self.assertTrue(any(f["rule_id"] == "R001"
+                            for f in screened["findings"]))
+        self.assertTrue(any(f["rule_id"] == "R003"
+                            for f in screened["findings"]))
+        run = self.wb.conn.execute(
+            "SELECT facts_sha256,facts_json FROM screen_runs"
+            " ORDER BY id DESC LIMIT 1").fetchone()
+        snapshot = json.loads(run["facts_json"])
+        self.assertEqual(run["facts_sha256"], hashlib.sha256(
+            json.dumps(snapshot, ensure_ascii=False, sort_keys=True,
+                       separators=(",", ":")).encode("utf-8")).hexdigest())
+        state = self.wb.state()
+        self.assertEqual(state["file_binding_history_total"], 1)
+        self.assertEqual(state["confirmation_history_total"], 6)
+        self.assertEqual(state["file_binding_history"][0]["evidence_id"],
+                         evidence_ids[0])
+        self.assertEqual(state["last_screen_run"]["facts_sha256"],
+                         run["facts_sha256"])
 
     def test_empty_and_failed_uploads(self):
         result = self.wb.run_screen()  # 空工作区：0 finding，不崩
@@ -586,7 +654,7 @@ class HttpSmokeTests(unittest.TestCase):
         self.assertEqual(code, 200)
         about = json.loads(body)
         self.assertEqual(about["author"], "刘奇")
-        self.assertEqual(about["version"], "0.1.0")
+        self.assertEqual(about["version"], "0.2.0")
 
     def test_update_check_is_explicitly_unconfigured_without_repository(self):
         from unittest.mock import patch
@@ -686,6 +754,17 @@ class HttpSmokeTests(unittest.TestCase):
             conf = {}
             self.post(f"/api/upload?name={quote(B01_PDF.name)}",
                       B01_PDF.read_bytes())
+            # 分页接口返回稳定候选页，不把全量数据塞进首次界面状态。
+            page1 = json.loads(self.get(
+                "/api/state?candidate_offset=0&candidate_limit=1")[1])
+            self.assertEqual(len(page1["candidates"]), 1)
+            self.assertGreater(page1["candidate_total"], 1)
+            self.assertTrue(page1["candidate_has_more"])
+            page2 = json.loads(self.get(
+                "/api/state?candidate_offset=1&candidate_limit=1")[1])
+            self.assertEqual(len(page2["candidates"]), 1)
+            self.assertNotEqual(page1["candidates"][0]["id"],
+                                page2["candidates"][0]["id"])
             sha_docx = __import__("hashlib").sha256(
                 B01_DOCX.read_bytes()).hexdigest()
             sha_pdf = __import__("hashlib").sha256(
@@ -710,11 +789,39 @@ class HttpSmokeTests(unittest.TestCase):
                     {"Content-Type": "application/json"})
                 self.assertEqual(code, 200)
                 self.assertTrue(json.loads(body)["ok"])
+            amount = next(c for c in json.loads(self.get("/api/state")[1])["candidates"]
+                          if c["field"] == "total_price"
+                          and c["sha256"] == sha_docx)
+            value = amount["value"]
+            code, body = self.post("/api/confirm_amount", json.dumps({
+                "event_id": "EV-2026-001-01", "lot_id": "SYN-LOT-001",
+                "bidder_id": "SYN-BIDDER-01", "raw_value": value["raw"],
+                "unit": value["unit_hint"],
+                "currency": amount.get("currency_hint") or "unknown",
+                "tax_included": "unknown",
+                "evidence_id": amount["evidence_id"], "action": "confirm",
+            }).encode(), {"Content-Type": "application/json"})
+            self.assertEqual(code, 200)
+            self.assertTrue(json.loads(body)["ok"])
+            code, body = self.post("/api/bind_file", json.dumps({
+                "event_id": "EV-2026-001-01", "lot_id": "SYN-LOT-001",
+                "bidder_id": "SYN-BIDDER-01", "sha256": sha_docx,
+                "context": "bid_document", "source_type": "bid_document",
+                "declared_owner_id": "SYN-BIDDER-OTHER",
+            }).encode(), {"Content-Type": "application/json"})
+            self.assertEqual(code, 200)
+            self.assertTrue(json.loads(body)["ok"])
             code, body = self.post("/api/screen", b"{}")
             self.assertEqual(code, 200)
             payload = json.loads(body)
             r002 = [f for f in payload["findings"] if f["rule_id"] == "R002"]
             self.assertEqual(len(r002), 1)
+            self.assertTrue(any(f["rule_id"] == "R001"
+                                for f in payload["findings"]))
+            refreshed = json.loads(self.get("/api/state")[1])
+            self.assertEqual(refreshed["last_screen_run"]["status"], "completed")
+            self.assertEqual(len(refreshed["last_screen_run"]["facts_sha256"]), 64)
+            self.assertEqual(refreshed["file_binding_history_total"], 1)
             for f in payload["findings"]:
                 for eid in f["evidence_ids"]:
                     ecode, ebody = self.get("/api/evidence/" + eid)
@@ -809,17 +916,39 @@ class BrowserImportFixTests(unittest.TestCase):
         rows = self.wb.conn.execute(
             "SELECT COUNT(*) n FROM confirmations").fetchone()["n"]
         self.assertEqual(rows, 0)
-        # 合法有限数值与布尔税口径保持原值
-        ok1 = self.wb.confirm_field("EV-1", "L1", "B1", "total_price",
-                                    100.5, eid, "confirm")
-        ok2 = self.wb.confirm_field("EV-1", "L1", "B1", "tax_included",
-                                    True, eid, "confirm")
-        self.assertTrue(ok1["ok"] and ok2["ok"])
-        vals = {r["field"]: json.loads(r["value"]) for r in
-                self.wb.conn.execute(
-                    "SELECT field, value FROM confirmations")}
-        self.assertEqual(vals["total_price"], 100.5)
+        # 数值、币种、税口径必须一次提交，失败时不留部分确认。
+        for bad in (True, False, float("inf"), "abc"):
+            ok = self.wb.confirm_amount("EV-1", "L1", "B1", bad, "yuan",
+                                        "CNY", True, eid)
+            self.assertFalse(ok["ok"], repr(bad))
+        self.assertEqual(self.wb.conn.execute(
+            "SELECT COUNT(*) FROM confirmations").fetchone()[0], 0)
+        ok = self.wb.confirm_amount("EV-1", "L1", "B1", "100.5", "yuan",
+                                    "CNY", True, eid)
+        self.assertTrue(ok["ok"])
+        vals = {}
+        for row in self.wb.conn.execute("SELECT field,value FROM confirmations"):
+            try:
+                vals[row["field"]] = json.loads(row["value"])
+            except (TypeError, ValueError):
+                vals[row["field"]] = row["value"]
+        self.assertEqual(vals["total_price"], "100.5")
+        self.assertEqual(vals["currency"], "CNY")
         self.assertIs(vals["tax_included"], True)
+
+    def test_foreign_or_conflicting_amount_is_rejected_without_partial_write(self):
+        self.wb.ingest_bytes("蓝湾.docx", B01_DOCX.read_bytes())
+        eid = self.wb.conn.execute(
+            "SELECT evidence_id FROM candidates WHERE field='total_price'"
+            " LIMIT 1").fetchone()["evidence_id"]
+        for raw, currency in (("USD 100", "USD"), ("CNY $100", "CNY")):
+            before = self.wb.conn.execute(
+                "SELECT COUNT(*) FROM confirmations").fetchone()[0]
+            result = self.wb.confirm_amount(
+                "EV-1", "L1", "B1", raw, "yuan", currency, True, eid)
+            self.assertFalse(result["ok"])
+            self.assertEqual(self.wb.conn.execute(
+                "SELECT COUNT(*) FROM confirmations").fetchone()[0], before)
 
     def test_build_facts_bool_price_not_number(self):
         # 规则事实边界直接拒绝布尔金额，不能等价于数字 1 再参与 R005。
@@ -930,7 +1059,14 @@ class UploadBehaviorTests(unittest.TestCase):
                 "counts_json": json.dumps({"images_ocr": 2,
                                             "images_pending_ocr": 1})}],
             "candidates": [],
-            "confirmations": []})
+            "candidate_total": 0, "candidate_offset": 0,
+            "candidate_limit": 200, "candidate_has_more": False,
+            "confirmations": [], "confirmation_history": [],
+            "confirmation_history_total": 0,
+            "file_binding_history": [], "file_binding_history_total": 0,
+            "file_bindings": [],
+            "last_screen_run": {"status": "completed",
+                                "rule_statuses": {}}})
         harness = """
 const src=%s;
 const STATE=%s;
@@ -955,7 +1091,7 @@ global.document={querySelector:s=>(els[s]=els[s]||makeEl()),
 global.window={open(){}};
 global.setTimeout=()=>0;
 global.fetch=async(url,opt)=>{calls.push({url});
-  if(url==="/api/state")
+  if(url.indexOf("/api/state")===0)
     return {ok:true,status:200,json:async()=>STATE};
   if(url.indexOf("/api/evidence/")===0)
     return {ok:true,status:200,json:async()=>EV};
@@ -1033,7 +1169,7 @@ function collect(n,out){out=out||[];if(!n||!n._kids)return out;
     findingsBox, findingsPanelCount:fbKids.length,sourceText,retryButtonText,
     retryCalls:retryCalls.length,jobPollCalls:jobPollCalls.length,screenError,
     docxTaskText}));
-})().catch(e=>{console.error("HARNESS_FAIL",e&&e.message);process.exit(1)});
+})().catch(e=>{console.error("HARNESS_FAIL",e&&e.stack||e&&e.message);process.exit(1)});
 """
         cls.tmp = tempfile.mkdtemp(prefix="biaojing_p3_behavior_")
         cls.js_path = os.path.join(cls.tmp, "page.js")
