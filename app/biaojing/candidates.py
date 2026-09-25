@@ -15,9 +15,18 @@
       按单位换算（×10000）并在说明中标注，绝不静默错标。
     - 中标结果语义归一（_outcome_value）：中标候选/候选推荐=candidate、
       最终中标/中标人=won、否决/废标=rejected、无效/无效标=invalid、
-      未中标/落标=lost、识别不了=unknown，绝不猜。
+      未中标/落标=lost、识别不了=unknown，绝不猜。F 线加固：否向线索
+      （不/未/非/无/没/从未/并非/不是）或疑问线索（是否/吗/？/?/能否）
+      出现时绝不 candidate/won；正反并存、否定的非显性落标「中标」
+      一律 unknown；rejected 只认否决/废标/被否决。
     - 公式单元格的有效值取 cached_value；缓存缺失（"unknown"）或错误值
       （"#REF!" 等）一律降级为 None/留空，绝不解析公式串本身。
+    - F 线（表头/报价行）：相邻标签行字段不相交时按双层表头合并成
+      一个逻辑表头，无法安全合并时输出 header_structure 披露；整行
+      全空的分隔行截断表头作用域（表内偶发空单元格不误伤）；同一
+      表头行同字段多列时单价列不自动取值、文本列取第一列，均在组
+      note 披露；币种归一白名单覆盖 RMB/￥/人民币（元）等常见写法，
+      不识别币种一律 unknown，绝不把自定义字符串带进可比组。
 """
 
 from __future__ import annotations
@@ -282,25 +291,48 @@ HEADER_LABELS = {
 }
 
 
-# 中标结果语义归一：按优先级命中第一类；顺序即语义边界——
-# 「中标候选人」同时含「中标」「候选」，必须先判候选；「否决」含「否」，
-# 必须先于普通落标；都认不出就落 unknown，绝不猜。
-_OUTCOME_RULES = (
-    ("candidate", ("候选", "拟中标", "预中标", "推荐中标")),
-    ("rejected", ("否决", "废标")),
-    ("invalid", ("无效",)),
-    ("lost", ("未中标", "未中", "落标", "未获得", "否")),
-    ("won", ("中标", "是")),
-)
+# 中标结果语义归一（F 线钉死的保守口径）：
+#   - 否向线索（不/未/非/无/没/从未/并非/不是）或疑问线索（是否/吗/？/?/能否）
+#     出现时，绝不映射 candidate/won；
+#   - 正反信号并存（候选标记 + 否定的中标，如「候选但从未中标」）→ unknown；
+#   - 否定的「中标」若非显性落标词（未中标/未中/落标/未获得）→ unknown
+#     而非 lost（「不是中标人」「未被认定为中标」不猜成落标）；
+#   - rejected 只认明确词（否决/废标/被否决），裸「否」是落标不是否决，
+#     「是否」里的「否」子串更不算；
+#   - 显性落标→lost、否决/废标→rejected、无效→invalid、中标/是→won、
+#     候选/拟中标/预中标/推荐中标→candidate、空/乱→unknown 全部保持；
+#     认不出一律 unknown，绝不猜。
+_OUTCOME_NEGATION_CUES = ("不", "未", "非", "无", "没", "从未", "并非", "不是")
+_OUTCOME_QUESTION_CUES = ("是否", "吗", "？", "?", "能否")
+_OUTCOME_CANDIDATE_TOKENS = ("候选", "拟中标", "预中标", "推荐中标")
+_OUTCOME_REJECTED_TOKENS = ("否决", "废标")
+_OUTCOME_INVALID_TOKENS = ("无效",)
+_OUTCOME_LOST_TOKENS = ("未中标", "未中", "落标", "未获得")
 
 
 def _outcome_value(value):
     text = str(value).strip().casefold()
     if not text:
         return "unknown"
-    for outcome, tokens in _OUTCOME_RULES:
-        if any(token in text for token in tokens):
-            return outcome
+    if any(token in text for token in _OUTCOME_REJECTED_TOKENS):
+        return "rejected"
+    if any(token in text for token in _OUTCOME_INVALID_TOKENS):
+        return "invalid"
+    negated = any(cue in text for cue in _OUTCOME_NEGATION_CUES)
+    questioned = any(cue in text for cue in _OUTCOME_QUESTION_CUES)
+    if any(token in text for token in _OUTCOME_CANDIDATE_TOKENS):
+        if negated or questioned:
+            return "unknown"  # 候选标记 + 否向/疑问并存 → 正反信号冲突，不猜
+        return "candidate"
+    if any(token in text for token in _OUTCOME_LOST_TOKENS):
+        return "lost"
+    if text.rstrip("。，,、；;．.") == "否":
+        return "lost"  # 整格裸「否」= 未中标；「是否」等子串不在此列
+    if negated or questioned:
+        # 否定的「中标」非显性落标词、或疑问句 → 绝不 candidate/won/lost
+        return "unknown"
+    if "中标" in text or text.rstrip("。，,、；;．.") == "是":
+        return "won"
     return "unknown"
 
 
@@ -308,6 +340,27 @@ def _outcome_value(value):
 # 为 "unknown"，Excel 错误值为 "#REF!" 等字符串）。取有效值时：
 # 公式串本身绝不解析；缓存缺失/错误一律降级为 None，留给人工。
 _FORMULA_CACHE_UNKNOWN = "unknown"
+
+
+# 币种归一（F 线缺口 3，扩白名单）：常见人民币写法全部归一为 CNY，
+# 避免 R004 comparable_key 按币种字符串分组时把同币种可比行拆散；
+# USD/EUR/JPY/HKD/GBP 等标准代码大小写不敏感、大写保留为各自币种；
+# 其余非空不识别值一律置 unknown（走「币种未知不进组」保守路径），
+# 绝不把自定义字符串带进 comparable_key。
+_CURRENCY_CNY_ALIASES = frozenset((
+    "cny", "rmb", "人民币", "人民币元", "人民币(元)", "人民币（元）",
+    "rmb(元)", "rmb（元）", "元", "￥", "¥",
+))
+_CURRENCY_STANDARD_CODES = frozenset(("USD", "EUR", "JPY", "HKD", "GBP"))
+
+
+def _normalize_currency_value(value):
+    text = str(value).strip()
+    if text.casefold() in _CURRENCY_CNY_ALIASES:
+        return "CNY"
+    if text.upper() in _CURRENCY_STANDARD_CODES:
+        return text.upper()
+    return "unknown"
 
 
 def _cell_effective_value(item):
@@ -349,13 +402,84 @@ def _is_total_mark(value):
     return any(mark in text for mark in _TOTAL_ROW_MARKS)
 
 
+def _is_blank_value(value):
+    """单元格是否为空（None 或全空白字符串）。"""
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _pure_label_row_values(row_values):
+    """双层表头合并护栏：一行内所有非空值是否全为已知表头标签。
+
+    只有非空值全是表头标签的行才允许并入逻辑表头——防止把恰好长成
+    标签样子的数据单元格（如品名「单位」）所在的数据行吃进表头。
+    """
+    for value in row_values.values():
+        if _is_blank_value(value):
+            continue
+        if not (isinstance(value, str) and value.strip() in HEADER_LABELS):
+            return False
+    return True
+
+
+def _merge_label_rows(rows_map, row_values):
+    """相邻表头行合并（双层表头，F 线缺口 5a）。
+
+    相邻两行各含 ≥1 个已知表头标签、字段不相交、且下一行非空值全部是
+    表头标签时，合并为一个逻辑表头（列映射取并集，数据行从第二行之后
+    开始）；字段重叠无法安全合并的相邻标签行作为疑似双层表头返回，由
+    调用方披露，绝不静默归零。
+
+    返回 (logical, conflicts)：
+      logical   —— [(start_row, end_row, {field: entry})]，按 start_row 升序；
+      conflicts —— [(row_a, row_b, "字段重叠：…")]。
+    """
+    rows = sorted(rows_map)
+    logical = []
+    conflicts = []
+    i = 0
+    while i < len(rows):
+        start = rows[i]
+        merged = dict(rows_map[start])
+        end = start
+        j = i + 1
+        while j < len(rows) and rows[j] == end + 1:
+            nxt = rows_map[rows[j]]
+            overlap = sorted(set(merged) & set(nxt))
+            if overlap:
+                conflicts.append(
+                    (end, rows[j], "字段重叠：" + "、".join(overlap)))
+                break
+            if not _pure_label_row_values(row_values.get(rows[j], {})):
+                break  # 下一行含非表头内容，按普通行处理：不合并也不披露
+            merged.update(nxt)
+            end = rows[j]
+            j += 1
+        logical.append((start, end, merged))
+        i = j
+    return logical, conflicts
+
+
+def _first_blank_row(rows_nonempty, after_row, before_row):
+    """全空分隔行（F 线缺口 5b）：(after_row, before_row) 开区间内第一行
+    不在 rows_nonempty（该表非空行集合）中的行号；只有整行（在已扫描
+    列范围内）全空才截断，表内偶发空单元格行不受影响。无则返回 None。"""
+    row = after_row + 1
+    while before_row is None or row < before_row:
+        if row not in rows_nonempty:
+            return row
+        row += 1
+    return None
+
+
 def _xlsx_header_suggestions(evidence: list[dict]):
     """XLSX 表头建议：明确表头标签所在列的下方非空单元格给候选。
 
     使用 P1 typed 字段（e["sheet"]/e["cell"]/e["value"]），不经 locator
-    显示字符串解析。数据行只归属其上方最近的表头行：重复表头各自生效，
-    分节标记行（采购包/下一表等）与合计行截断旧表头作用域——旧表头不得
-    套到后续所有行，不同采购包不得仅凭工作表名或投标人名称互相套用。
+    显示字符串解析。数据行只归属其上方最近的逻辑表头：重复表头各自生效，
+    分节标记行（采购包/下一表等）、合计行与整行全空的分隔行截断旧表头
+    作用域——旧表头不得套到后续所有行；相邻标签行字段不相交时按双层
+    表头合并（与 price_lines 同口径，F 线缺口 5a/5b），数据行从第二层
+    之后开始，孤立的但行标签数不足的行不当表头也不截断作用域。
     """
     cells = {}  # (sheet, col, row) -> (evidence_id, value)
     for e in evidence:
@@ -372,32 +496,64 @@ def _xlsx_header_suggestions(evidence: list[dict]):
             continue
         cells[(sheet, m.group(1), int(m.group(2)))] = (e.get("evidence_id"),
                                                        value)
-    # 表头行：同 sheet 同 row 内 ≥2 个已知表头标签
-    header_rows = defaultdict(list)
+    # 表头标签：同 sheet 同 row 内按列收集（同字段多列全部保留，逐列建议）
+    label_cols = defaultdict(dict)  # (sheet,row) -> {col: (field, hint, label, eid)}
     for (sheet, col, row), (eid, value) in cells.items():
         if isinstance(value, str) and value.strip() in HEADER_LABELS:
-            header_rows[(sheet, row)].append((col, eid, value.strip()))
+            field, hint = HEADER_LABELS[value.strip()]
+            label_cols[(sheet, row)][col] = (field, hint, value.strip(), eid)
     # 分节/合计标记行（截断点），按工作表归集
     cut_rows = defaultdict(list)
     for (sheet, _col, row), (_eid, value) in cells.items():
         if _is_section_mark(value) or _is_total_mark(value):
             cut_rows[sheet].append(row)
+    # 非空行集合（整行全空分隔行截断作用域）与行值（双层表头合并护栏）
+    nonempty_rows = defaultdict(set)
+    row_values = defaultdict(dict)
+    for (sheet, col, row), (_eid, value) in cells.items():
+        if not _is_blank_value(value):
+            nonempty_rows[sheet].add(row)
+            row_values[sheet].setdefault(row, {})[col] = value
     suggestions = []
-    for sheet in sorted({sheet for (sheet, _row) in header_rows}):
-        rows = sorted({row for (s, row) in header_rows if s == sheet})
-        rows = [row for row in rows if len(header_rows[(sheet, row)]) >= 2]
+    for sheet in sorted({sheet for (sheet, _row) in label_cols}):
+        col_maps = {row: cols for (s, row), cols in label_cols.items()
+                    if s == sheet}
+        field_maps = {}
+        for row, cols in col_maps.items():
+            fields = {}
+            for col in sorted(cols):
+                field, hint, label, eid = cols[col]
+                fields.setdefault(field, (col, hint, label, eid))
+            field_maps[row] = fields
+        logical, _conflicts = _merge_label_rows(field_maps,
+                                                row_values.get(sheet, {}))
+        # 疑似双层表头披露由 price_lines 路径统一输出，这里不重复；
+        # 不足 2 个标签的孤立标签行不当表头、也不截断前一表头的作用域
+        usable = []
+        for start_row, end_row, _fields in logical:
+            label_count = sum(len(col_maps.get(r, {}))
+                              for r in range(start_row, end_row + 1))
+            if label_count >= 2:
+                usable.append((start_row, end_row))
         cuts = sorted(set(cut_rows.get(sheet, ())))
-        for idx, hrow in enumerate(rows):
-            next_hrow = rows[idx + 1] if idx + 1 < len(rows) else None
-            cut = next((r for r in cuts if r > hrow), None)
-            # 旧表头作用域：到下一个表头行或最近的截断行（不含）为止
-            span_end = min((x for x in (next_hrow, cut) if x is not None),
-                           default=None)
-            for col, header_eid, label in header_rows[(sheet, hrow)]:
-                field, unit_hint = HEADER_LABELS[label]
+        nonempty = nonempty_rows.get(sheet, set())
+        for idx, (start_row, end_row) in enumerate(usable):
+            next_header = (usable[idx + 1][0]
+                           if idx + 1 < len(usable) else None)
+            cut = next((r for r in cuts if r > end_row), None)
+            blank = _first_blank_row(nonempty, end_row, next_header)
+            # 旧表头作用域：到下一个逻辑表头、最近的截断行或全空分隔行
+            #（不含）为止
+            span_end = min((x for x in (next_header, cut, blank)
+                            if x is not None), default=None)
+            merged_cols = {}
+            for r in range(start_row, end_row + 1):
+                merged_cols.update(col_maps.get(r, {}))
+            for col, (field, unit_hint, label,
+                      _header_eid) in sorted(merged_cols.items()):
                 for (s, c, r), (eid, value) in sorted(
                         cells.items(), key=lambda kv: (kv[0][0], kv[0][2])):
-                    if s != sheet or c != col or r <= hrow:
+                    if s != sheet or c != col or r <= end_row:
                         continue
                     if span_end is not None and r >= span_end:
                         continue
@@ -441,9 +597,13 @@ def _xlsx_price_line_candidates(evidence: list[dict]) -> list[dict]:
 
     公式单元格一律取缓存值（cached_value）参与解析；缓存缺失或为
     #REF! 等错误值时该字段降级（单价 None / 文本字段留 unknown），
-    绝不把公式串本身当数值。数据行只归属其上方最近的表头行；分节
-    标记行（采购包/下一表等）与合计行截断旧表头；分组键带分节边界，
-    不同采购包即使同表同名也不合并。
+    绝不把公式串本身当数值。数据行只归属其上方最近的逻辑表头；分节
+    标记行（采购包/下一表等）、合计行与整行全空的分隔行截断旧表头；
+    相邻标签行字段不相交时按双层表头合并，数据行从第二层之后开始，
+    无法安全合并的疑似双层表头输出披露（header_structure 候选）；
+    同一逻辑表头行内同字段多列时单价列不自动取值、文本列取第一列，
+    并一律在组 note 披露；分组键带分节边界，不同采购包即使同表同名
+    也不合并。
     """
     cells = {}
     for item in evidence:
@@ -455,26 +615,30 @@ def _xlsx_price_line_candidates(evidence: list[dict]) -> list[dict]:
             continue
         cells[(sheet, match.group(1), int(match.group(2)))] = item
 
-    # 表头行：同 sheet 同 row 内 ≥2 个已知表头标签（与表头建议口径一致，
-    # 避免单个杂散标签行冒充表头截断作用域）
+    # 表头行字段映射：同字段多列全部记入 dup_label_cols（含首列，按列序），
+    # label_rows 只存首列（F 线缺口 4：原实现后者覆盖前者，静默取末列）
     label_rows = defaultdict(dict)
+    dup_label_cols = defaultdict(lambda: defaultdict(list))
     for (sheet, col, row), item in cells.items():
         value = item.get("value")
         if isinstance(value, str) and value.strip() in HEADER_LABELS:
             field, hint = HEADER_LABELS[value.strip()]
-            label_rows[(sheet, row)][field] = (col, item, hint)
-    sheet_headers = defaultdict(list)
-    for (sheet, row), cols in label_rows.items():
-        if len(cols) >= 2:
-            sheet_headers[sheet].append((row, cols))
-    for sheet in sheet_headers:
-        sheet_headers[sheet].sort(key=lambda pair: pair[0])
+            row_fields = label_rows[(sheet, row)]
+            dup_label_cols[(sheet, row)][field].append(col)
+            if field not in row_fields:
+                row_fields[field] = (col, item, hint)
 
+    # 非空行集合（整行全空分隔行截断作用域）、行值（合并护栏）、
     # 分节/合计标记行
+    nonempty_rows = defaultdict(set)
+    sheet_row_values = defaultdict(dict)
     section_rows = defaultdict(list)
     cut_rows = defaultdict(list)
     for (sheet, col, row), item in cells.items():
         value = item.get("value")
+        if not _is_blank_value(value):
+            nonempty_rows[sheet].add(row)
+            sheet_row_values[sheet].setdefault(row, {})[col] = value
         if _is_section_mark(value):
             section_rows[sheet].append(row)
         if _is_section_mark(value) or _is_total_mark(value):
@@ -482,47 +646,119 @@ def _xlsx_price_line_candidates(evidence: list[dict]) -> list[dict]:
     for sheet in section_rows:
         section_rows[sheet].sort()
 
+    # 双层表头合并（F 线缺口 5a）+ 疑似双层表头披露（不许静默归零）
+    sheet_field_maps = defaultdict(dict)
+    for (sheet, row), row_fields in label_rows.items():
+        sheet_field_maps[sheet][row] = row_fields
+    logical_headers = {}
+    disclosures = []
+    for sheet, rows_map in sheet_field_maps.items():
+        logical, conflicts = _merge_label_rows(
+            rows_map, sheet_row_values.get(sheet, {}))
+        # 不足 2 个字段的孤立标签行不当表头、也不截断前一表头作用域
+        logical_headers[sheet] = [(start_row, end_row, fields)
+                                  for start_row, end_row, fields in logical
+                                  if len(fields) >= 2]
+        for row_a, row_b, reason in conflicts:
+            entry = next(iter(rows_map[row_a].values()))
+            anchor = entry[1]
+            disclosures.append({
+                "field": "header_structure",
+                "value": {"sheet": sheet, "rows": [row_a, row_b],
+                          "reason": reason},
+                "evidence_id": anchor.get("evidence_id"),
+                "locator": to_p2_locator(anchor) or
+                    {"kind": "xlsx_sheet_info", "sheet": sheet},
+                "locator_display": anchor.get("locator") or
+                    f"{sheet}!{entry[0]}{row_a}",
+                "note": f"疑似双层表头，未自动成组（{reason}）；"
+                        "须人工确认表头行后再抽取报价",
+            })
+
     grouped = defaultdict(list)
     group_evidence = defaultdict(set)
     group_primary = {}
-    for sheet, hlist in sorted(sheet_headers.items()):
+    group_notes = defaultdict(set)
+    group_header_row = {}
+    span_orphans = defaultdict(int)
+    for sheet in sorted(logical_headers):
+        hlist = logical_headers[sheet]
         cuts = sorted(set(cut_rows.get(sheet, ())))
-        for idx, (header_row, cols) in enumerate(hlist):
+        nonempty = nonempty_rows.get(sheet, set())
+        for idx, (header_row, header_end, cols) in enumerate(hlist):
             bidder_col = cols.get("bidder_code") or cols.get("bidder_name")
-            price_col = cols.get("unit_price")
-            if not bidder_col or not price_col:
+            # 同一逻辑表头（含合并的多行）内同字段全部列；首列生效，余列披露
+            #（仅统计真正重复（≥2 列）的字段）
+            dup_fields = {}
+            for part_row in range(header_row, header_end + 1):
+                for field, cols_list in dup_label_cols.get(
+                        (sheet, part_row), {}).items():
+                    if len(cols_list) >= 2:
+                        dup_fields.setdefault(field, []).extend(cols_list)
+            dup_price = "unit_price" in dup_fields
+            price_col = None if dup_price else cols.get("unit_price")
+            if not bidder_col or (not price_col and not dup_price):
                 continue
             item_fields = [field for field in ("item_code", "item_name", "spec")
                            if field in cols]
             if not item_fields or not ("item_code" in cols
                                        or {"item_name", "spec"} <= set(cols)):
                 continue
-            next_hrow = hlist[idx + 1][0] if idx + 1 < len(hlist) else None
-            cut = next((r for r in cuts if r > header_row), None)
-            # 旧表头作用域：到下一个表头行或最近的截断行（不含）为止
-            span_end = min((x for x in (next_hrow, cut) if x is not None),
-                           default=None)
+            next_header = hlist[idx + 1][0] if idx + 1 < len(hlist) else None
+            cut = next((r for r in cuts if r > header_end), None)
+            blank = _first_blank_row(nonempty, header_end, next_header)
+            # 旧表头作用域：到下一个逻辑表头、最近的截断行或全空分隔行
+            #（不含）为止
+            span_end = min((x for x in (next_header, cut, blank)
+                            if x is not None), default=None)
             for row_no in sorted({r for s, _, r in cells
-                                  if s == sheet and r > header_row
+                                  if s == sheet and r > header_end
                                   and (span_end is None or r < span_end)}):
+                # 分组键带分节边界：不同采购包（或“下一表”分节）即使
+                # 同工作表、同投标人名称也不合并。分节号只依赖 row_no 与
+                # section_rows[sheet]，在字段循环前即可确定——清单字段的
+                # 组证据必须用同一三元组键（F 线缺口 2：原 (sheet, bidder)
+                # 二元组键与输出端三元组键不匹配，清单证据从未进顶层）。
+                section = 0
+                for boundary in section_rows.get(sheet, ()):
+                    if boundary <= row_no:
+                        section = boundary
+                    else:
+                        break
                 bidder_cell = cells.get((sheet, bidder_col[0], row_no))
-                price_cell = cells.get((sheet, price_col[0], row_no))
-                if not bidder_cell or not price_cell:
+                price_cell = (cells.get((sheet, price_col[0], row_no))
+                              if price_col else None)
+                if price_col and (not price_cell
+                                  or price_cell.get("value") in (None, "")):
+                    continue  # 无单价单元格或单价格本身为空
+                bidder_value = (_cell_effective_value(bidder_cell)
+                                if bidder_cell else None)
+                if not bidder_cell or bidder_value in (None, ""):
+                    # 主体缺失（公式无缓存/疑似合并单元格缺行）：行不归属，
+                    # 但有单价的行计数披露，绝不静默丢弃
+                    if price_cell is not None:
+                        span_orphans[(sheet, header_row)] += 1
                     continue
-                bidder_value = _cell_effective_value(bidder_cell)
-                if bidder_value in (None, ""):
-                    continue  # 主体未知（如公式无缓存）→ 行不归属，不猜
-                if price_cell.get("value") in (None, ""):
-                    continue  # 单价格本身为空
-                price_value = _cell_effective_value(price_cell)
-                parsed_price = parse_amount(
-                    "" if price_value is None else price_value, price_col[2])
+                bidder_key = str(bidder_value).strip()
+                group_key = (sheet, section, bidder_key)
+                group_header_row.setdefault(group_key, header_row)
+                if price_col:
+                    price_value = _cell_effective_value(price_cell)
+                    parsed_price = parse_amount(
+                        "" if price_value is None else price_value,
+                        price_col[2])
+                else:
+                    parsed_price = None  # 重复单价列：不自动取值
                 line = {"item_code": "unknown", "item_name": "unknown",
                         "spec": "unknown", "unit": "unknown", "qty": None,
-                        "unit_price": parsed_price["amount_yuan"],
+                        "unit_price": (parsed_price["amount_yuan"]
+                                       if parsed_price else None),
                         "currency": "unknown", "tax_included": None,
-                        "evidence": price_cell.get("evidence_id"),
-                        "field_evidence": {"unit_price": price_cell.get("evidence_id")}}
+                        "evidence": (price_cell.get("evidence_id")
+                                     if price_cell else None),
+                        "field_evidence": (
+                            {"unit_price": price_cell.get("evidence_id")}
+                            if price_cell else {})}
                 for field in ("item_code", "item_name", "spec", "unit", "qty",
                               "currency", "tax_included"):
                     if field not in cols:
@@ -534,8 +770,8 @@ def _xlsx_price_line_candidates(evidence: list[dict]) -> list[dict]:
                     val = _cell_effective_value(source)
                     if val in (None, ""):
                         continue  # 缓存缺失/错误 → 字段留默认，留给人工
-                    if field == "currency" and str(val).strip() in ("人民币", "元", "CNY"):
-                        val = "CNY"
+                    if field == "currency":
+                        val = _normalize_currency_value(val)
                     if field == "tax_included":
                         normalized_tax = str(val).strip().casefold()
                         val = (True if normalized_tax in ("是", "含税", "true", "yes")
@@ -544,48 +780,58 @@ def _xlsx_price_line_candidates(evidence: list[dict]) -> list[dict]:
                     line[field] = val
                     line["field_evidence"][field] = source.get("evidence_id")
                     if source.get("evidence_id"):
-                        group_evidence[(sheet, str(bidder_value).strip())].add(
-                            source["evidence_id"])
-                if parsed_price["status"] != "normalized":
+                        group_evidence[group_key].add(source["evidence_id"])
+                if parsed_price and parsed_price["status"] != "normalized":
                     line["unit_price"] = None
                 bidder_name = ""
                 if "bidder_name" in cols:
                     source = cells.get((sheet, cols["bidder_name"][0], row_no))
                     bidder_name = (str(_cell_effective_value(source) or "")
                                    if source else "")
-                # 分组键带分节边界：不同采购包（或“下一表”分节）即使
-                # 同工作表、同投标人名称也不合并
-                section = 0
-                for boundary in section_rows.get(sheet, ()):
-                    if boundary <= row_no:
-                        section = boundary
-                    else:
-                        break
-                bidder_key = str(bidder_value).strip()
-                group_key = (sheet, section, bidder_key)
                 grouped[group_key].append(line)
-                group_primary.setdefault(group_key, price_cell)
-                group_evidence[group_key].add(price_cell.get("evidence_id"))
+                group_primary.setdefault(group_key, price_cell or bidder_cell)
+                if price_cell is not None:
+                    group_evidence[group_key].add(price_cell.get("evidence_id"))
                 group_evidence[group_key].add(bidder_cell.get("evidence_id"))
                 if bidder_name and "bidder_name" in cols:
                     source = cells.get((sheet, cols["bidder_name"][0], row_no))
                     if source:
                         group_evidence[group_key].add(source.get("evidence_id"))
+                for field, cols_list in dup_fields.items():
+                    desc = "、".join(cols_list)
+                    if field == "unit_price":
+                        group_notes[group_key].add(
+                            f"表头重复：unit_price 出现在 {desc} 列，"
+                            "未自动取值，须人工指定")
+                    else:
+                        group_notes[group_key].add(
+                            f"表头重复：{field} 出现在 {desc} 列，"
+                            "已取第一列，须人工核对")
 
     output = []
     for (sheet, section, bidder), lines in sorted(grouped.items()):
         ids = sorted(x for x in group_evidence[(sheet, section, bidder)] if x)
         if not ids:
             continue
-        primary = group_primary[(sheet, section, bidder)]
+        key = (sheet, section, bidder)
+        primary = group_primary[key]
+        note = "按投标主体汇总的完整清单行；每行保留字段证据定位，须逐项核对后确认"
+        extras = sorted(group_notes.get(key, ()))
+        if extras:
+            note += "；" + "；".join(extras)
+        orphans = span_orphans.get((sheet, group_header_row.get(key)), 0)
+        if orphans:
+            note += (f"；检测到 {orphans} 行有单价但主体为空"
+                     "（疑似合并单元格导致的缺行或公式无缓存），须人工核对")
         output.append({
             "field": "price_lines", "value": lines,
             "evidence_id": primary.get("evidence_id"), "evidence_ids": ids,
             "locator": to_p2_locator(primary),
             "locator_display": primary.get("locator") or
                 f"{sheet}（{len(lines)} 条报价行）",
-            "note": "按投标主体汇总的完整清单行；每行保留字段证据定位，须逐项核对后确认",
+            "note": note,
         })
+    output.extend(disclosures)
     return output
 
 
