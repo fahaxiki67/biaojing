@@ -354,6 +354,13 @@ class Workbench:
                 quote = str(e.get("text") if e.get("text") is not None
                             else e.get("value") if e.get("value") is not None
                             else "")
+                if e.get("formula") is not None:
+                    cached = e.get("cached_value")
+                    cached_text = ("未知（文件未提供缓存）"
+                                   if cached in (None, "unknown")
+                                   else str(cached))
+                    quote = (f"公式：{e['formula']}\n缓存值：{cached_text}"
+                             "（Excel 可能尚未重新计算）")
                 self.conn.execute(
                     "INSERT OR REPLACE INTO evidence_store"
                     " (evidence_id, sha256, ordinal, kind, locator_display,"

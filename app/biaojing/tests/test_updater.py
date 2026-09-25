@@ -87,8 +87,8 @@ class UpdaterTests(unittest.TestCase):
             "status": "unconfigured", "current_version": updater.VERSION})
 
     def test_github_release_asset_is_digest_verified_and_staged(self):
-        archive = bundle("0.2.1")
-        tag = "v0.2.1"
+        archive = bundle("0.2.2")
+        tag = "v0.2.2"
         api_payload = json.dumps({
             "tag_name": tag,
             "assets": [{

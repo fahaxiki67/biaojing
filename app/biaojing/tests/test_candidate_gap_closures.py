@@ -157,6 +157,81 @@ class GroupEvidenceKeyTests(unittest.TestCase):
         self.assertNotIn("E-分包-A3", ids_high, "包一证据不得串进包二组")
 
 
+class PriceLineUnitDisclosureTests(unittest.TestCase):
+    def test_formula_without_cache_is_visible_in_group_note(self):
+        evidence = [
+            xcell("公式待核", "A1", "投标人"),
+            xcell("公式待核", "B1", "综合单价(元)"),
+            xcell("公式待核", "C1", "清单名称"),
+            xcell("公式待核", "D1", "规格型号"),
+            xcell("公式待核", "A2", "甲公司"),
+            xcell("公式待核", "B2", "=Z9"),
+            xcell("公式待核", "C2", "电线"),
+            xcell("公式待核", "D2", "BV"),
+        ]
+        group = candidates._xlsx_price_line_candidates(evidence)[0]
+        self.assertIsNone(group["value"][0]["unit_price"])
+        self.assertIn("公式待核!B2", group["note"])
+        self.assertIn("缓存值缺失或无效", group["note"])
+
+    def test_formula_cache_is_used_with_recalculation_warning(self):
+        evidence = [
+            xcell("公式缓存待核", "A1", "投标人"),
+            xcell("公式缓存待核", "B1", "综合单价(元)"),
+            xcell("公式缓存待核", "C1", "清单名称"),
+            xcell("公式缓存待核", "D1", "规格型号"),
+            xcell("公式缓存待核", "A2", "甲公司"),
+            xcell("公式缓存待核", "B2", "=100+20", cached=120),
+            xcell("公式缓存待核", "C2", "电线"),
+            xcell("公式缓存待核", "D2", "BV"),
+        ]
+        group = candidates._xlsx_price_line_candidates(evidence)[0]
+        self.assertEqual(group["value"][0]["unit_price"], "120")
+        self.assertIn("公式缓存待核!B2", group["note"])
+        self.assertIn("采用公式缓存值 120", group["note"])
+        self.assertIn("可能尚未重新计算", group["note"])
+
+    def test_missing_unit_is_visible_in_group_note(self):
+        evidence = [
+            xcell("单位待核", "A1", "投标人"),
+            xcell("单位待核", "B1", "综合单价"),
+            xcell("单位待核", "C1", "清单名称"),
+            xcell("单位待核", "D1", "规格型号"),
+            xcell("单位待核", "A2", "甲公司"),
+            xcell("单位待核", "B2", 53.8),
+            xcell("单位待核", "C2", "电线"),
+            xcell("单位待核", "D2", "BV"),
+        ]
+        group = candidates._xlsx_price_line_candidates(evidence)[0]
+        self.assertIsNone(group["value"][0]["unit_price"])
+        self.assertIn("单位未知", group["note"])
+        self.assertIn("单位待核!B2", group["note"])
+        self.assertIn("不进入 R004", group["note"])
+
+    def test_yuan_header_currency_hint_matches_total_price(self):
+        evidence = [
+            xcell("币种口径", "A1", "投标人"),
+            xcell("币种口径", "B1", "综合单价(元)"),
+            xcell("币种口径", "C1", "清单名称"),
+            xcell("币种口径", "D1", "规格型号"),
+            xcell("币种口径", "E1", "总报价(元)"),
+            xcell("币种口径", "A2", "甲公司"),
+            xcell("币种口径", "B2", 100),
+            xcell("币种口径", "C2", "电线"),
+            xcell("币种口径", "D2", "BV"),
+            xcell("币种口径", "E2", 200),
+        ]
+        group = candidates._xlsx_price_line_candidates(evidence)[0]
+        line = group["value"][0]
+        self.assertEqual(line["currency"], "CNY")
+        self.assertEqual(line["field_evidence"]["currency"],
+                         "E-币种口径-B1")
+        self.assertIn("由表头", group["note"])
+        total = next(item for item in candidates._xlsx_header_suggestions(evidence)
+                     if item["field"] == "total_price")
+        self.assertEqual(total["currency_hint"], line["currency"])
+
+
 # --------------------------------------------- 缺口 3：币种归一白名单
 
 def currency_sheet(values):
@@ -402,6 +477,10 @@ class OutcomeNegatedPolarityTests(unittest.TestCase):
     def test_lexicalized_lost_terms_keep_mapping(self):
         for text in ("未中标", "未中", "落标", "未获得"):
             self.assertEqual(candidates._outcome_value(text), "lost", text)
+
+    def test_asked_or_negated_lost_terms_are_unknown(self):
+        for text in ("是否未中标？", "没有未中标", "并非未中标", "落标吗？"):
+            self.assertEqual(candidates._outcome_value(text), "unknown", text)
 
 
 if __name__ == "__main__":

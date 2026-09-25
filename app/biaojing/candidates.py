@@ -34,6 +34,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from bisect import bisect_right
 from collections import defaultdict
 
 from .money import parse_amount
@@ -306,7 +307,6 @@ _OUTCOME_NEGATION_CUES = ("不", "未", "非", "无", "没", "从未", "并非",
 _OUTCOME_QUESTION_CUES = ("是否", "吗", "？", "?", "能否")
 _OUTCOME_CANDIDATE_TOKENS = ("候选", "拟中标", "预中标", "推荐中标")
 _OUTCOME_REJECTED_TOKENS = ("否决", "废标")
-_OUTCOME_INVALID_TOKENS = ("无效",)
 _OUTCOME_LOST_TOKENS = ("未中标", "未中", "落标", "未获得")
 
 
@@ -337,7 +337,13 @@ def _outcome_value(value):
         if negated or questioned:
             return "unknown"  # 候选标记 + 否向/疑问并存 → 正反信号冲突，不猜
         return "candidate"
-    if any(token in text for token in _OUTCOME_LOST_TOKENS):
+    lost_hit = next((token for token in _OUTCOME_LOST_TOKENS if token in text),
+                    None)
+    if lost_hit is not None:
+        without = text.replace(lost_hit, "")
+        if any(cue in without for cue in _OUTCOME_NEGATION_CUES) or \
+                any(cue in without for cue in _OUTCOME_QUESTION_CUES):
+            return "unknown"
         return "lost"
     if text.rstrip("。，,、；;．.") == "否":
         return "lost"  # 整格裸「否」= 未中标；「是否」等子串不在此列
@@ -647,6 +653,7 @@ def _xlsx_price_line_candidates(evidence: list[dict]) -> list[dict]:
     # 此处换算成 (列起, 列止, 行起, 行止)，供纵向主体锚点回填与
     # 横向合并表头覆盖列识别；旧解析输出无该证据时行为与原先一致
     merge_spans = defaultdict(list)
+    vertical_merge_ranges = defaultdict(list)
     for item in evidence:
         if item.get("kind") != "xlsx_merged_range":
             continue
@@ -658,8 +665,22 @@ def _xlsx_price_line_candidates(evidence: list[dict]) -> list[dict]:
         c1, r1 = _col_index(m.group(1)), int(m.group(2))
         c2 = _col_index(m.group(3)) if m.group(3) else c1
         r2 = int(m.group(4)) if m.group(4) else r1
-        merge_spans[sheet].append((min(c1, c2), max(c1, c2),
-                                   min(r1, r2), max(r1, r2)))
+        start_col, end_col = min(c1, c2), max(c1, c2)
+        start_row, end_row = min(r1, r2), max(r1, r2)
+        merge_spans[sheet].append((start_col, end_col, start_row, end_row))
+        if start_col == end_col and start_row < end_row:
+            vertical_merge_ranges[(sheet, start_col)].append(
+                (start_row, end_row))
+
+    # 只对无重叠的纵向单列合并回填。二分查找保持逐行查找为 O(log n)，
+    # 避免大表每个空主体都扫描最多 1000 个合并区域；重叠区域不自动归属。
+    vertical_merge_starts = {}
+    for key, spans in vertical_merge_ranges.items():
+        spans.sort()
+        if any(start <= previous_end
+               for (_, previous_end), (start, _) in zip(spans, spans[1:])):
+            continue
+        vertical_merge_starts[key] = [start for start, _ in spans]
 
     # 表头行字段映射：同字段多列全部记入 dup_label_cols（含首列，按列序），
     # label_rows 只存首列（F 线缺口 4：原实现后者覆盖前者，静默取末列）；
@@ -669,17 +690,6 @@ def _xlsx_price_line_candidates(evidence: list[dict]) -> list[dict]:
     for (sheet, col, row), item in cells.items():
         value = item.get("value")
         label = value.strip() if isinstance(value, str) else None
-        if not label:
-            col_idx = _col_index(col)
-            for (c1, c2, r1, r2) in merge_spans.get(sheet, ()):
-                if c1 <= col_idx <= c2 and r1 <= row <= r2 \
-                        and not (col_idx == c1 and row == r1):
-                    anchor_cell = cells.get((sheet, _col_letter(c1), r1))
-                    anchor_value = (anchor_cell.get("value")
-                                    if anchor_cell else None)
-                    label = (anchor_value.strip()
-                             if isinstance(anchor_value, str) else None)
-                    break
         if label and label in HEADER_LABELS:
             field, hint = HEADER_LABELS[label]
             row_fields = label_rows[(sheet, row)]
@@ -688,7 +698,8 @@ def _xlsx_price_line_candidates(evidence: list[dict]) -> list[dict]:
                 row_fields[field] = (col, item, hint)
 
     # 合并表头覆盖列补注册（P2-8 下半）：被覆盖的空单元格不产证据，
-    # 上面的逐格循环看不到它们——按锚点标签为覆盖列补记同字段；
+    # 上面的逐格循环看不到它们——按锚点标签为首尾列补记同字段；完整
+    # 合并范围另有 xlsx_merged_range 证据，避免按超宽范围逐列展开；
     # 由此形成的同字段多列交给既有重复字段保守策略（unit_price
     # 不自动取值并披露，文本取第一列），绝不自动选列
     for sheet, spans in merge_spans.items():
@@ -704,7 +715,7 @@ def _xlsx_price_line_candidates(evidence: list[dict]) -> list[dict]:
             field, hint = HEADER_LABELS[label]
             row_fields = label_rows[(sheet, r1)]
             known = dup_label_cols[(sheet, r1)][field]
-            for col_idx in range(c1, c2 + 1):
+            for col_idx in (c1,) if c1 == c2 else (c1, c2):
                 col = _col_letter(col_idx)
                 if col not in known:
                     known.append(col)
@@ -821,16 +832,20 @@ def _xlsx_price_line_candidates(evidence: list[dict]) -> list[dict]:
                     # 的投标人列以锚点值归属，缺行不再静默看似完整；
                     # 锚点也为空（公式无缓存等）→ 维持不归属，不猜
                     bidder_idx = _col_index(bidder_col[0])
-                    for (c1, c2, r1, r2) in merge_spans.get(sheet, ()):
-                        if c1 <= bidder_idx <= c2 and r1 <= row_no <= r2:
-                            anchor_cell = cells.get(
-                                (sheet, _col_letter(c1), r1))
-                            anchor_value = (_cell_effective_value(anchor_cell)
-                                            if anchor_cell else None)
-                            if anchor_value not in (None, ""):
-                                bidder_value = anchor_value
-                                merged_bidder = (anchor_cell, c1, r1)
-                            break
+                    key = (sheet, bidder_idx)
+                    starts = vertical_merge_starts.get(key, ())
+                    ranges = vertical_merge_ranges.get(key, ())
+                    index = bisect_right(starts, row_no) - 1
+                    if index >= 0 and ranges[index][1] >= row_no:
+                        anchor_row = ranges[index][0]
+                        anchor_cell = cells.get(
+                            (sheet, bidder_col[0], anchor_row))
+                        anchor_value = (_cell_effective_value(anchor_cell)
+                                        if anchor_cell else None)
+                        if anchor_value not in (None, ""):
+                            bidder_value = anchor_value
+                            merged_bidder = (anchor_cell, bidder_idx,
+                                             anchor_row)
                 if merged_bidder is None and (not bidder_cell
                                               or bidder_value in (None, "")):
                     # 主体缺失（公式无缓存/疑似合并单元格缺行）：行不归属，
@@ -843,6 +858,21 @@ def _xlsx_price_line_candidates(evidence: list[dict]) -> list[dict]:
                 group_header_row.setdefault(group_key, header_row)
                 if price_col:
                     price_value = _cell_effective_value(price_cell)
+                    formula_value = price_cell.get("value")
+                    if (price_value is None and isinstance(formula_value, str)
+                            and formula_value.startswith("=")):
+                        locator = (price_cell.get("locator")
+                                   or f"{sheet}!{price_col[0]}{row_no}")
+                        group_notes[group_key].add(
+                            f"{locator}：单价为公式但缓存值缺失或无效，"
+                            "未推断金额；须回到原表核对")
+                    elif (isinstance(formula_value, str)
+                          and formula_value.startswith("=")):
+                        locator = (price_cell.get("locator")
+                                   or f"{sheet}!{price_col[0]}{row_no}")
+                        group_notes[group_key].add(
+                            f"{locator}：单价采用公式缓存值 {price_value}，"
+                            "Excel 可能尚未重新计算；须人工核对")
                     parsed_price = parse_amount(
                         "" if price_value is None else price_value,
                         price_col[2])
@@ -882,6 +912,30 @@ def _xlsx_price_line_candidates(evidence: list[dict]) -> list[dict]:
                         group_evidence[group_key].add(source["evidence_id"])
                 if parsed_price and parsed_price["status"] != "normalized":
                     line["unit_price"] = None
+                    if parsed_price["status"] == "needs_unit":
+                        locator = (price_cell.get("locator") if price_cell
+                                   else f"{sheet}!{price_col[0]}{row_no}")
+                        group_notes[group_key].add(
+                            f"{locator}：单价单位未知，未归一且不进入 R004；"
+                            "请人工核对后更正或标 unknown")
+                elif parsed_price and "currency" not in cols:
+                    # 与 total_price 的候选 metadata 统一：只有显式“元”表头
+                    # 且金额文本无其他币种标记时推断 CNY，并保留表头证据与
+                    # 待核提示；无单位/外币不猜，也不影响显式币种列。
+                    header_cell = price_col[1] if price_col else None
+                    if parsed_price["currency"] != "unknown":
+                        line["currency"] = parsed_price["currency"]
+                    elif price_col and price_col[2] == "yuan":
+                        line["currency"] = "CNY"
+                        header_eid = (header_cell.get("evidence_id")
+                                      if header_cell else None)
+                        if header_eid:
+                            line["field_evidence"]["currency"] = header_eid
+                            group_evidence[group_key].add(header_eid)
+                        label = (header_cell.get("value")
+                                 if header_cell else "元")
+                        group_notes[group_key].add(
+                            f"币种 CNY 由表头“{label}”推断，须人工核对")
                 bidder_name = ""
                 if "bidder_name" in cols:
                     source = cells.get((sheet, cols["bidder_name"][0], row_no))

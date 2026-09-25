@@ -112,6 +112,50 @@ class OcrEvidencePersistenceTests(unittest.TestCase):
                 wb.close()
 
 
+class FormulaEvidencePersistenceTests(unittest.TestCase):
+    def test_xlsx_formula_evidence_keeps_cache_and_locator(self):
+        import openpyxl
+        from zipfile import ZIP_DEFLATED, ZipFile
+
+        xlsx = io.BytesIO()
+        book = openpyxl.Workbook()
+        sheet = book.active
+        sheet.title = "报价"
+        sheet.append(["投标人", "综合单价(元)", "清单名称", "规格型号"])
+        sheet.append(["甲公司", "=100+20", "电线", "BV"])
+        book.save(xlsx)
+
+        # openpyxl 不计算公式；仅在合成文件中写入模拟缓存，不接触真实资料。
+        cached_xlsx = io.BytesIO()
+        with ZipFile(io.BytesIO(xlsx.getvalue())) as source, \
+                ZipFile(cached_xlsx, "w", ZIP_DEFLATED) as target:
+            for item in source.infolist():
+                data = source.read(item.filename)
+                if item.filename == "xl/worksheets/sheet1.xml":
+                    formula_xml = b"<f>100+20</f><v></v>"
+                    self.assertIn(formula_xml, data)
+                    data = data.replace(
+                        formula_xml, b"<f>100+20</f><v>120</v>", 1)
+                target.writestr(item, data)
+
+        with tempfile.TemporaryDirectory(prefix="biaojing_formula_") as directory:
+            workbench = ws_mod.Workbench(directory)
+            try:
+                result = workbench.ingest_bytes("报价.xlsx", cached_xlsx.getvalue())
+                self.assertEqual(result["status"], "success")
+                evidence_id = workbench.conn.execute(
+                    "SELECT evidence_id FROM evidence_store"
+                    " WHERE locator_display='报价!B2'"
+                ).fetchone()[0]
+                evidence = workbench.evidence_by_id(evidence_id)
+                self.assertEqual(evidence["locator_display"], "报价!B2")
+                self.assertIn("公式：=100+20", evidence["quote"])
+                self.assertIn("缓存值：120", evidence["quote"])
+                self.assertIn("可能尚未重新计算", evidence["quote"])
+            finally:
+                workbench.close()
+
+
 # ---------------------------------------------------------------- 证据 ID
 
 class EvidenceIdTests(unittest.TestCase):
@@ -675,7 +719,7 @@ class HttpSmokeTests(unittest.TestCase):
         self.assertEqual(code, 200)
         about = json.loads(body)
         self.assertEqual(about["author"], "刘奇")
-        self.assertEqual(about["version"], "0.2.0")
+        self.assertEqual(about["version"], "0.2.1")
 
     def test_update_check_is_explicitly_unconfigured_without_repository(self):
         from unittest.mock import patch

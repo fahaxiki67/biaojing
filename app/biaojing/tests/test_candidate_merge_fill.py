@@ -91,6 +91,24 @@ class CandidateMergeFillTests(unittest.TestCase):
         self.assertIn("B", note)
         self.assertIn("C", note)
 
+    def test_very_wide_merged_header_does_not_expand_every_column(self):
+        # 合成极宽标题，完整范围应被披露，但候选只按实际表格行取值。
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "超宽标题"
+        ws["B1"] = "综合单价(元)"
+        ws.merge_cells("B1:XFD1")
+        ws.append(["投标人", "综合单价(元)", "清单名称", "规格型号"])
+        ws.append(["甲公司", 100, "电线", "BV"])
+
+        tagged, cands = _pipeline(wb)
+        groups = _price_line_candidates(cands)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["value"][0]["unit_price"], "100")
+        disclosure = [e for e in tagged
+                      if e.get("kind") == "xlsx_merged_range"]
+        self.assertEqual(disclosure[0]["range"], "B1:XFD1")
+
     def test_empty_anchor_keeps_row_unowned(self):
         # 锚点为公式且无缓存：维持不归属，不猜
         wb = openpyxl.Workbook()
@@ -105,6 +123,22 @@ class CandidateMergeFillTests(unittest.TestCase):
         ws["B3"] = 110
         ws["C3"] = "开关"
         ws["D3"] = "10A"
+        _, cands = _pipeline(wb)
+        self.assertEqual(_price_line_candidates(cands), [])
+
+    def test_cross_column_merge_does_not_supply_bidder(self):
+        # 合并区域横跨投标人列，但锚点在左侧备注列；不能把备注当成主体。
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "跨列合并"
+        ws.append(["备注", "投标人", "综合单价(元)", "清单名称", "规格型号"])
+        ws["A2"] = "备注文字不能用作主体"
+        ws.merge_cells("A2:B3")
+        for row, (price, item, spec) in zip(
+                (2, 3), ((100, "电线", "BV"), (110, "开关", "10A"))):
+            ws.cell(row=row, column=3, value=price)
+            ws.cell(row=row, column=4, value=item)
+            ws.cell(row=row, column=5, value=spec)
         _, cands = _pipeline(wb)
         self.assertEqual(_price_line_candidates(cands), [])
 
