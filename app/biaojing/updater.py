@@ -261,8 +261,9 @@ def check_and_stage_update(repository: str | None = None) -> dict:
                 "latest_version": tag}
 
 
-def apply_pending_update(project_root: str | Path | None = None) -> str | None:
-    """Swap the package, import-check it, and restore the prior version on failure."""
+def apply_pending_update(project_root: str | Path | None = None,
+                         workspace_root: str | Path | None = None) -> str | None:
+    """Check imports and migration on a workspace copy before keeping the update."""
     root = Path(project_root) if project_root is not None else _project_root()
     staging = root / ".biaojing-update-staging"
     pending = _pending(root)
@@ -295,21 +296,42 @@ def apply_pending_update(project_root: str | Path | None = None) -> str | None:
         if missing:
             raise UpdateError("更新包缺少关键模块：" + ", ".join(missing))
         smoke = (
-            "import importlib,pathlib,sys\n"
+            "import importlib,pathlib,sqlite3,sys,tempfile\n"
             "package=pathlib.Path(sys.argv[1]);"
             "sys.path.insert(0,str(package.parent));sys.dont_write_bytecode=True\n"
             "for p in package.rglob('*.py'):"
             "compile(p.read_text(encoding='utf-8'),str(p),'exec')\n"
             "for n in " + repr(modules) + ": importlib.import_module('biaojing.'+n)\n"
         )
+        if workspace_root is not None:
+            smoke += (
+                "workspace=pathlib.Path(sys.argv[2]);"
+                "source_db=workspace/'biaojing.sqlite3'\n"
+                "with tempfile.TemporaryDirectory(prefix='biaojing-update-check-') as tmp:\n"
+                " target_db=pathlib.Path(tmp)/'biaojing.sqlite3'\n"
+                " if source_db.is_file():\n"
+                "  src=sqlite3.connect(source_db.as_uri()+'?mode=ro',uri=True)\n"
+                "  dst=sqlite3.connect(target_db)\n"
+                "  try: src.backup(dst)\n"
+                "  finally: dst.close();src.close()\n"
+                " from biaojing.workspace import Workbench\n"
+                " wb=Workbench(tmp)\n"
+                " try:\n"
+                "  check=wb.conn.execute('PRAGMA quick_check').fetchone()[0]\n"
+                "  assert check=='ok',check\n"
+                " finally: wb.close()\n"
+            )
         env = os.environ.copy()
         package_parent = str(root / "app")
         existing = env.get("PYTHONPATH")
         env["PYTHONPATH"] = (package_parent + os.pathsep + existing
                              if existing else package_parent)
         try:
+            command = [sys.executable, "-c", smoke, str(target)]
+            if workspace_root is not None:
+                command.append(str(Path(workspace_root).expanduser().resolve()))
             result = subprocess.run(
-                [sys.executable, "-c", smoke, str(target)],
+                command,
                 cwd=root, env=env, capture_output=True, text=True, timeout=30)
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise UpdateError(f"更新兼容性检查未完成：{exc}") from exc
@@ -335,10 +357,12 @@ def apply_pending_update(project_root: str | Path | None = None) -> str | None:
     return tag
 
 
-def update_at_start(repository: str | None = None) -> str | None:
+def update_at_start(repository: str | None = None,
+                    workspace_root: str | Path | None = None) -> str | None:
     """Apply a staged update, then automatically check and install a new release."""
-    applied = apply_pending_update()
+    applied = apply_pending_update(workspace_root=workspace_root)
     if applied:
         return applied
     result = check_and_stage_update(repository)
-    return apply_pending_update() if result["status"] == "staged" else None
+    return (apply_pending_update(workspace_root=workspace_root)
+            if result["status"] == "staged" else None)

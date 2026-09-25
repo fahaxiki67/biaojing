@@ -230,6 +230,27 @@ class WorkbenchTests(unittest.TestCase):
         self.assertTrue(all(r["evidence_id"].startswith(
             "E-" + r1["sha256"][:12]) for r in cands))
 
+    def test_state_paginates_source_occurrences_and_returns_compact_summary(self):
+        self.wb.conn.executemany(
+            "INSERT INTO source_refs(ref,status,seen_at) VALUES(?,?,?)",
+            [(f"source-{i}.pdf", "unknown", "2026-01-01")
+             for i in range(3)])
+        self.wb.conn.commit()
+
+        first = self.wb.state(source_limit=2)
+        second = self.wb.state(source_offset=2, source_limit=2)
+        self.assertEqual([r["ref"] for r in first["source_rows"]],
+                         ["source-0.pdf", "source-1.pdf"])
+        self.assertEqual(first["source_total"], 3)
+        self.assertTrue(first["source_has_more"])
+        self.assertEqual([r["ref"] for r in second["source_rows"]],
+                         ["source-2.pdf"])
+        self.assertFalse(second["source_has_more"])
+        self.assertEqual(second["confirmation_count"], 0)
+        self.assertNotIn("sources", second)
+        self.assertNotIn("confirmations", second)
+        self.assertNotIn("file_bindings", second)
+
     def test_xlsx_extraction_version_is_recorded(self):
         from biaojing import xlsx_parser
 
@@ -1047,24 +1068,20 @@ class UploadBehaviorTests(unittest.TestCase):
                                  "pending_ocr", "pending_convert",
                                  "duplicate", "rejected", "archived",
                                  "unknown"]},
-            "sources": [], "source_rows": [{
+            "source_rows": [{
                 "ref": "160页投标文件.pdf", "doc_type": "pdf",
                 "status": "partial", "reason": None, "parser": "pymupdf",
                 "sha256": "a" * 64, "extract_version": "pymupdf test profile",
                 "counts_json": json.dumps({"pages_ocr": 151,
-                                            "pages_pending_ocr": 9})}, {
-                "ref": "Word投标文件.docx", "doc_type": "docx",
-                "status": "partial", "reason": None, "parser": "python-docx",
-                "sha256": "b" * 64, "extract_version": "docx image OCR",
-                "counts_json": json.dumps({"images_ocr": 2,
-                                            "images_pending_ocr": 1})}],
+                                            "pages_pending_ocr": 9})}],
+            "source_total": 2, "source_offset": 0, "source_limit": 100,
+            "source_has_more": True,
             "candidates": [],
             "candidate_total": 0, "candidate_offset": 0,
             "candidate_limit": 200, "candidate_has_more": False,
-            "confirmations": [], "confirmation_history": [],
+            "confirmation_count": 0, "confirmation_history": [],
             "confirmation_history_total": 0,
             "file_binding_history": [], "file_binding_history_total": 0,
-            "file_bindings": [],
             "last_screen_run": {"status": "completed",
                                 "rule_statuses": {}}})
         harness = """
@@ -1091,8 +1108,16 @@ global.document={querySelector:s=>(els[s]=els[s]||makeEl()),
 global.window={open(){}};
 global.setTimeout=()=>0;
 global.fetch=async(url,opt)=>{calls.push({url});
-  if(url.indexOf("/api/state")===0)
-    return {ok:true,status:200,json:async()=>STATE};
+  if(url.indexOf("/api/state")===0){
+    const state=JSON.parse(JSON.stringify(STATE));
+    const sourceOffset=Number(new URL(url,"http://local").searchParams.get("source_offset")||0);
+    if(sourceOffset){state.source_rows=[{ref:"Word投标文件.docx",doc_type:"docx",
+      status:"partial",parser:"python-docx",sha256:"b".repeat(64),
+      extract_version:"docx image OCR",counts_json:JSON.stringify({images_ocr:2,
+      images_pending_ocr:1})}];
+      state.source_offset=sourceOffset;state.source_has_more=false;}
+    return {ok:true,status:200,json:async()=>state};
+  }
   if(url.indexOf("/api/evidence/")===0)
     return {ok:true,status:200,json:async()=>EV};
   if(url==="/api/screen")
@@ -1112,7 +1137,7 @@ global.fetch=async(url,opt)=>{calls.push({url});
 // 真实分隔符用 String.fromCharCode(10) 生成，避免 Python→JS 的多层
 // 反斜杠转义；eval 内同时覆盖 loadState，消除与页面自身调用的竞态
 const NL=String.fromCharCode(10);
-eval(src+NL+";globalThis.__T={uploadFiles,reportReject,dropClickHandler,els,calls,clickLog,renderCands,loadState};"
+eval(src+NL+";globalThis.__T={uploadFiles,reportReject,dropClickHandler,els,calls,clickLog,renderCands,loadState,setLoadState:fn=>{loadState=fn}};"
   + NL+"globalThis.__T.waitForJob=waitForJob;"
   + NL+"loadState=async()=>{};");
 """ % (json.dumps(js), state_stub)
@@ -1131,11 +1156,11 @@ function collect(n,out){out=out||[];if(!n||!n._kids)return out;
   const state={product_name:"标镜",
     coverage:{total_input_occurrences:0,unique_files:0,by_status:{},
       status_order:["success"]},
-    sources:[],source_rows:[],
+    source_rows:[],source_total:0,source_has_more:false,
     candidates:[{id:8,sha256:"d".repeat(64),field:"total_price",
       value:119860000,evidence_id:"E-deadbeefcafe-0008",
       locator_display:"paragraph 8",note:"标签匹配",companion:null}],
-    confirmations:[]};
+    confirmation_count:0};
   T.renderCands(state);
   const btns=collect(T.els["#cands"]).filter(
     n=>n.textContent==="查看证据"&&n._handlers&&n._handlers.click);
@@ -1146,6 +1171,12 @@ function collect(n,out){out=out||[];if(!n||!n._kids)return out;
   const panelText=collect(panel).map(n=>n.textContent||"").join("│");
   // 刷新回显：执行页面原版 loadState（/api/state stub 含非空 findings）
   await T.loadState();
+  if(T.els["#moreSources"].hidden)
+    throw new Error("来源分页按钮未显示");
+  T.setLoadState(T.loadState);
+  await T.els["#moreSources"]._handlers.click();
+  if(!T.els["#sourcePage"].textContent.includes("2 / 2"))
+    throw new Error("来源追加分页未保留并显示全部来源");
   const fbKids=collect(T.els["#findings"]);
   const findingsBox=fbKids.map(n=>n.textContent||"").join("│");
   const sourceText=collect(T.els["#sources"]).map(n=>n.textContent||"").join("│");

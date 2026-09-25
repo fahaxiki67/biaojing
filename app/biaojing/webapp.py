@@ -259,9 +259,12 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 offset = int(qs.get("candidate_offset", ["0"])[0])
                 limit = int(qs.get("candidate_limit", ["200"])[0])
-                self._send_json(wb.state(offset, limit))
+                source_offset = int(qs.get("source_offset", ["0"])[0])
+                source_limit = int(qs.get("source_limit", ["100"])[0])
+                self._send_json(wb.state(offset, limit, source_offset,
+                                         source_limit))
             except (TypeError, ValueError) as exc:
-                self._reject(400, f"候选分页参数无效：{exc}")
+                self._reject(400, f"工作台分页参数无效：{exc}")
             return
         if self.path == "/api/about":
             from . import AUTHOR, PRODUCT_NAME, VERSION

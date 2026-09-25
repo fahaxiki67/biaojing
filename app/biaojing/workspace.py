@@ -709,23 +709,25 @@ class Workbench:
 
     @_locked
     def state(self, candidate_offset: int = 0,
-              candidate_limit: int = 200) -> dict:
-        """返回工作台状态和一页候选，避免每次刷新装入全部候选。"""
+              candidate_limit: int = 200, source_offset: int = 0,
+              source_limit: int = 100) -> dict:
+        """返回工作台摘要及一页来源和候选，避免大批次全量回传。"""
         if type(candidate_offset) is not int or candidate_offset < 0:
             raise ValueError("candidate_offset 须为非负整数")
         if type(candidate_limit) is not int or not 1 <= candidate_limit <= 500:
             raise ValueError("candidate_limit 须为 1 到 500")
+        if type(source_offset) is not int or source_offset < 0:
+            raise ValueError("source_offset 须为非负整数")
+        if type(source_limit) is not int or not 1 <= source_limit <= 500:
+            raise ValueError("source_limit 须为 1 到 500")
         cov = self.coverage()
-        sources = [dict(r) for r in self.conn.execute(
-            "SELECT sha256, doc_type, status, parser, counts_json,"
-            " source_type, first_ref, extract_version"
-            " FROM sources ORDER BY imported_at")]
         # 来源行：每次输入出现一行（含 duplicate/rejected），重复可见
+        source_total = cov["total_input_occurrences"]
         source_rows = [dict(r) for r in self.conn.execute(
             "SELECT r.ref, r.status, r.reason, s.doc_type, s.parser,"
             " s.sha256, s.counts_json, s.extract_version, s.source_type"
             " FROM source_refs r LEFT JOIN sources s ON s.sha256 = r.sha256"
-            " ORDER BY r.id")]
+            " ORDER BY r.id LIMIT ? OFFSET ?", (source_limit, source_offset))]
         candidate_total = self.conn.execute(
             "SELECT COUNT(*) FROM candidates").fetchone()[0]
         cands = [dict(r) for r in self.conn.execute(
@@ -739,23 +741,15 @@ class Workbench:
             c["companion"] = json.loads(comp) if comp else None
             meta = c.pop("candidate_meta_json")
             c.update(json.loads(meta) if meta else {})
-        confirms = [dict(r) for r in self.conn.execute(
-            "SELECT event_id, lot_id, bidder_id, field, value, evidence_id,"
-            " source_role, original_candidate, action, confirmed_at, person_id,"
-            " evidence_version FROM confirmations WHERE field NOT IN"
-            " ('contact_phone','contact_email','bank_account','person_manager',"
-            " 'person_tech','authorize_rep','legal_rep','id_number')"
-            " ORDER BY id")]
-        confirms.extend(dict(r) for r in self.conn.execute(
-            "SELECT event_id, lot_id, bidder_id, field, value, evidence_id,"
-            " source_role, original_candidate, action, confirmed_at"
-            " FROM contact_facts WHERE action IN ('confirm','correct','unknown')"
-            " ORDER BY id"))
-        confirms.extend(dict(r) for r in self.conn.execute(
-            "SELECT event_id,lot_id,bidder_id,field,value,evidence_id,person_id,"
-            " original_candidate,action,confirmed_at,evidence_version"
-            " FROM person_facts WHERE action IN ('confirm','correct','unknown')"
-            " ORDER BY id"))
+        confirmation_count = sum(self.conn.execute(
+            "SELECT COUNT(*) FROM " + table + where).fetchone()[0]
+            for table, where in (
+                ("confirmations", " WHERE field NOT IN"
+                 " ('contact_phone','contact_email','bank_account','person_manager',"
+                 " 'person_tech','authorize_rep','legal_rep','id_number')"),
+                ("contact_facts", " WHERE action IN ('confirm','correct','unknown')"),
+                ("person_facts", " WHERE action IN ('confirm','correct','unknown')"),
+            ))
         history_total = self.conn.execute(
             "SELECT COUNT(*) FROM confirmation_history").fetchone()[0]
         history = [dict(r) for r in self.conn.execute(
@@ -789,8 +783,11 @@ class Workbench:
         } if last_run else {"status": "not_run"})
         return {
             "product": "标镜", "product_name": "标镜",
-            "coverage": cov, "sources": sources, "source_rows": source_rows,
-            "candidates": cands, "confirmations": confirms,
+            "coverage": cov, "source_rows": source_rows,
+            "source_total": source_total, "source_offset": source_offset,
+            "source_limit": source_limit,
+            "source_has_more": source_offset + len(source_rows) < source_total,
+            "candidates": cands, "confirmation_count": confirmation_count,
             "candidate_total": candidate_total,
             "candidate_offset": candidate_offset,
             "candidate_limit": candidate_limit,
@@ -799,10 +796,6 @@ class Workbench:
             "confirmation_history_total": history_total,
             "file_binding_history": binding_history,
             "file_binding_history_total": binding_history_total,
-            "file_bindings": [dict(r) for r in self.conn.execute(
-                "SELECT event_id, lot_id, bidder_id, sha256, context,"
-                " source_type, declared_owner_id, declared_uscc"
-                " FROM file_bindings ORDER BY id")],
             "findings": findings,
             "last_screen_run": last_screen_run,
         }

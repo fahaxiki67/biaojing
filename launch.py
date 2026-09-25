@@ -24,7 +24,7 @@ def main(argv=None):
     if not args.check:
         try:
             from biaojing.updater import update_at_start
-            updated_to = update_at_start()
+            updated_to = update_at_start(workspace_root=args.workspace)
             if updated_to:
                 print(f'已自动更新到 {updated_to}，正在重新启动。', flush=True)
                 os.execv(sys.executable, [sys.executable, str(ROOT / 'launch.py'), *run_args])

@@ -117,8 +117,8 @@ class CompatibilityTests(unittest.TestCase):
                 self.assertEqual(result['counts'], {
                     'pages_total': 2, 'pages_text': 1, 'pages_ocr': 1,
                     'pages_pending_ocr': 0, 'pages_blank': 0})
-                self.assertEqual(len(wb.state()['confirmations']), 1)
-                self.assertEqual(wb.state()['sources'][0]['status'], 'success')
+                self.assertEqual(wb.state()['confirmation_count'], 1)
+                self.assertEqual(wb.state()['source_rows'][0]['status'], 'success')
                 self.assertEqual(wb.original_bytes(sha), data)
                 recovered = [c for c in wb.state()['candidates']
                              if c['field'] == 'bidder_name']
@@ -232,7 +232,7 @@ class CompatibilityTests(unittest.TestCase):
                 result = wb.confirm_field(['bad'], 'lot', 'bid', 'total_price',
                                           10, None, action='unknown')
                 self.assertFalse(result['ok'])
-                self.assertEqual(wb.state()['confirmations'], [])
+                self.assertEqual(wb.state()['confirmation_count'], 0)
             finally:
                 wb.close()
 
@@ -293,7 +293,7 @@ class CompatibilityTests(unittest.TestCase):
                         concurrent.futures.ThreadPoolExecutor(2) as pool:
                     statuses = list(pool.map(ingest, ['a.pdf', 'b.pdf']))
                 self.assertEqual(sorted(statuses), ['duplicate', 'success'])
-                self.assertEqual(len(wb.state()['sources']), 1)
+                self.assertEqual(wb.state()['coverage']['unique_files'], 1)
                 self.assertEqual(len(wb.state()['source_rows']), 2)
             finally:
                 wb.close()

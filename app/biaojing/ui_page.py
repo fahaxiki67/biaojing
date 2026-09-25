@@ -78,6 +78,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <table style="margin-top:10px"><thead><tr>
 <th>来源引用</th><th>类型</th><th>状态</th><th>原因</th><th>解析器 / 最近版本</th><th>操作</th></tr></thead>
 <tbody id="sources"></tbody></table>
+<p id="sourcePage" class="dim"></p><button id="moreSources" class="ghost" hidden>加载更多来源记录</button>
 </section>
 
 <section>
@@ -314,20 +315,33 @@ async function uploadFiles(list,errors){
 }
 
 // ---- 状态与覆盖率 ----
-let candidateOffset=0,candidateState=null;
-async function loadState(append=false){
-  const offset=append?candidateOffset:0;
-  const st=await api("/api/state?candidate_offset="+offset+"&candidate_limit=200");
-  const pageCount=st.candidates.length;
-  if(append&&candidateState){st.candidates=[...candidateState.candidates,...st.candidates]}
+let candidateOffset=0,sourceOffset=0,candidateState=null;
+async function loadState(page=null){
+  const appendCandidates=page==="candidates",appendSources=page==="sources";
+  const offset=appendCandidates?candidateOffset:0;
+  const sourcePageOffset=appendSources?sourceOffset:0;
+  const st=await api("/api/state?candidate_offset="+offset+"&candidate_limit=200"
+    +"&source_offset="+sourcePageOffset+"&source_limit=100");
+  const pageCount=st.candidates.length,sourcePageCount=st.source_rows.length;
+  if(candidateState){
+    if(appendCandidates)st.candidates=[...candidateState.candidates,...st.candidates];
+    else if(appendSources)st.candidates=candidateState.candidates;
+    if(appendSources)st.source_rows=[...candidateState.source_rows,...st.source_rows];
+    else if(appendCandidates)st.source_rows=candidateState.source_rows;
+  }
   candidateState=st;
-  candidateOffset=offset+pageCount;
+  if(appendCandidates)candidateOffset=offset+pageCount;
+  else if(!appendSources)candidateOffset=pageCount;
+  if(appendSources)sourceOffset=sourcePageOffset+sourcePageCount;
+  else if(!appendCandidates)sourceOffset=sourcePageCount;
   const cov=st.coverage, by=cov.by_status, tb=$("#coverage tbody");
   tb.textContent="";
   const tr=el("tr");tb.appendChild(tr);
   for(const s of cov.status_order){const td=el("td",String(by[s]||0),statusClass(s)==="dim"?"":statusClass(s));tr.appendChild(td)}
   tr.appendChild(el("td",String(cov.total_input_occurrences)));
   const srcTb=$("#sources");srcTb.textContent="";
+  $("#sourcePage").textContent="已显示 "+st.source_rows.length+" / "+st.source_total+" 条来源记录";
+  $("#moreSources").hidden=!st.source_has_more;
   if(!st.source_rows.length){const tr2=el("tr");const td=el("td","尚未导入资料","dim");td.colSpan=6;tr2.appendChild(td);srcTb.appendChild(tr2)}
   for(const s of st.source_rows){
     const tr3=el("tr");
@@ -448,7 +462,8 @@ function renderCands(st){
     tr.appendChild(td);tb.appendChild(tr);
   }
 }
-$("#moreCandidates").addEventListener("click",()=>loadState(true));
+$("#moreCandidates").addEventListener("click",()=>loadState("candidates"));
+$("#moreSources").addEventListener("click",()=>loadState("sources"));
 async function doConfirm(cand,action,fixValue){
   const eid=$("#eid").value.trim(),lid=$("#lid").value.trim(),bid=$("#bid").value.trim();
   if(!eid||!lid||!bid){toast("请先填写事件 / 标段 / 主体 ID");return}
@@ -502,8 +517,8 @@ async function bindFile(source){
 }
 function renderConfirms(st){
   const p=$("#confCount");
-  p.textContent=st.confirmations.length
-    ? "当前已确认 "+st.confirmations.length+" 项事实；历史操作 "+st.confirmation_history_total+" 条（追加保存）"
+  p.textContent=st.confirmation_count
+    ? "当前已确认 "+st.confirmation_count+" 项事实；历史操作 "+st.confirmation_history_total+" 条（追加保存）"
     : "已确认 0 条字段";
 }
 function renderHistory(st){
