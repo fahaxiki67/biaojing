@@ -299,13 +299,19 @@ async function uploadFiles(list,errors){
           log.textContent+="[已取消] "+relPath+"：剩余页已保留待处理，可稍后重试\\n";
         j=task.result||{};
       }
-      // HTTP 200 ≠ 业务成功：failed/rejected 按服务端结果计入失败
-      const items=j.results||[j.result||{}];
+      // HTTP 200 ≠ 业务成功：failed/rejected 按服务端结果计入失败。
+      // 长任务结果形态兼容：ZIP 任务是 {results:[…]}；PDF/DOCX 后台
+      // 任务把单条结果直接放在顶层（status/ref/candidates，无
+      // results/result 包裹键）——只认两个包裹键会把真实状态全部
+      // 丢成 "[?]"，并把业务失败误计成已处理。
+      const items=Array.isArray(j.results)?j.results
+        :((j.status!=null||j.ref!=null||j.sha256!=null)?[j]:[j.result||{}]);
       for(const x of items)
         log.textContent+="["+ (x.status||"?") +"] "+(x.ref||relPath)
           + (x.candidates!=null?("，候选 "+x.candidates+" 条"):"")
           + (x.error?("，"+x.error):"") + "\\n";
-      if(items.some(x=>x.status==="failed"||x.status==="rejected")) fail++;
+      if(items.some(x=>x.status==="failed"||x.status==="rejected"
+        ||x.status==="partial")) fail++;
       else done++;
     }catch(err){log.textContent+="[失败] "+relPath+"："+err.message+"\\n";fail++}
   }
