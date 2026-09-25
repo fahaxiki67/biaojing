@@ -45,8 +45,12 @@ DEFAULT_MAX_SCAN_ROWS = 50_000
 DEFAULT_MAX_SCAN_CELLS = 2_000_000
 EXTRACTION_VERSION = (
     f"{PARSER_NAME}; read-only streaming; formula/cache paired; comments via OOXML; "
-    f"rows={DEFAULT_MAX_SCAN_ROWS}; cells={DEFAULT_MAX_SCAN_CELLS}; v1"
+    f"rows={DEFAULT_MAX_SCAN_ROWS}; cells={DEFAULT_MAX_SCAN_CELLS}; "
+    f"merged-range disclosure; v2"
 )
+
+# 合并区域披露上限（防畸形文件）：触顶留痕，不做静默截断
+_MAX_MERGED_RANGES = 1000
 
 
 class _HeldBytesIO(io.BytesIO):
@@ -115,11 +119,59 @@ def _comments_by_sheet(data: bytes) -> tuple[dict, list[str]]:
     return comments, notes
 
 
+def _merged_ranges_by_sheet(data: bytes) -> tuple[dict, list[str]]:
+    """只读解压 OOXML，从各工作表部件收集 mergeCells 合并区域。
+
+    read_only 模式下 openpyxl 不暴露 merged_cells（恒为 None），这里直接
+    读工作表 XML 的 <mergeCell ref="A2:A4"/>；合并区域到候选行/列的填充
+    属于候选层，本层只负责把结构如实暴露，触顶留痕不做静默截断。
+    """
+    ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    rel_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    pkg_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+    merges: dict[str, list[str]] = {}
+    notes: list[str] = []
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as package:
+            workbook = ET.fromstring(package.read("xl/workbook.xml"))
+            relationships = ET.fromstring(
+                package.read("xl/_rels/workbook.xml.rels"))
+            targets = {r.attrib["Id"]: r.attrib["Target"]
+                       for r in relationships.findall(f"{{{pkg_ns}}}Relationship")}
+            for sheet in workbook.findall(f"{{{ns}}}sheets/{{{ns}}}sheet"):
+                sheet_name = sheet.attrib.get("name", "")
+                target = targets.get(sheet.attrib.get(f"{{{rel_ns}}}id"))
+                if not target:
+                    continue
+                sheet_path = (posixpath.normpath(target.lstrip("/"))
+                              if target.startswith("/") else
+                              posixpath.normpath(posixpath.join("xl", target)))
+                try:
+                    root = ET.fromstring(package.read(sheet_path))
+                except (OSError, KeyError, ET.ParseError):
+                    continue
+                refs = [m.attrib.get("ref", "")
+                        for m in root.findall(f".//{{{ns}}}mergeCell")]
+                refs = [ref for ref in refs if ref]
+                if len(refs) > _MAX_MERGED_RANGES:
+                    notes.append(
+                        f"工作表 [{sheet_name}] 合并区域超过 "
+                        f"{_MAX_MERGED_RANGES} 条，超出部分未读取"
+                        "（触顶留痕，不做静默截断）")
+                    refs = refs[:_MAX_MERGED_RANGES]
+                if refs:
+                    merges[sheet_name] = refs
+    except (OSError, KeyError, ValueError, ET.ParseError, zipfile.BadZipFile) as exc:
+        notes.append(f"Excel 合并区域读取不完整：{type(exc).__name__}: {exc}")
+    return merges, notes
+
+
 def parse(data: bytes, max_cells: int = 20_000,
           max_scan_rows: int = DEFAULT_MAX_SCAN_ROWS,
           max_scan_cells: int = DEFAULT_MAX_SCAN_CELLS) -> dict:
     comments, comment_notes = _comments_by_sheet(data)
-    notes = list(comment_notes)
+    merges, merge_notes = _merged_ranges_by_sheet(data)
+    notes = list(comment_notes) + merge_notes
     evidence_truncated = False
     scan_truncated = False
     wb_f = openpyxl.load_workbook(
@@ -163,6 +215,18 @@ def parse(data: bytes, max_cells: int = 20_000,
                 "sheet_type": str(getattr(ws, "sheet_type", "worksheet")),
                 "dimension_rows_x_cols": declared,
             })
+            # 合并区域披露：read_only 下 openpyxl 不暴露 merged_cells，
+            # 由 OOXML 直读；仅左上角持有值，候选层不自动填充，留给人工
+            for ref in merges.get(ws.title, ()):
+                evidence.append({
+                    "kind": "xlsx_merged_range",
+                    "locator": f"{ws.title}!{ref}",
+                    "sheet": ws.title,
+                    "range": ref,
+                    "quote": (f"合并区域 {ref}：仅左上角单元格持有值，"
+                              "其余单元格解析为空；候选层不自动填充，"
+                              "须人工对照原表确认归属"),
+                })
             ws_v = sheet_views[idx] if idx < len(sheet_views) else None
             sheet_max_col = ws.max_column or 1
             sheet_max_row = ws.max_row or 1
@@ -258,6 +322,7 @@ def parse(data: bytes, max_cells: int = 20_000,
             "cells_total": cells_total,
             "formulas_total": formulas_total,
             "formulas_cached_unknown": cached_unknown,
+            "merged_ranges_total": sum(len(v) for v in merges.values()),
         }
 
         if scan_truncated or evidence_truncated or comments_incomplete:
