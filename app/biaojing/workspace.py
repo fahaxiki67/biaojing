@@ -815,7 +815,8 @@ class Workbench:
                       action: str = "confirm",
                       original_candidate: str | None = None,
                       source_role: str = "unknown",
-                      person_id: str | None = None) -> dict:
+                      person_id: str | None = None,
+                      reviewer_type: str | None = None) -> dict:
         """确认/更正/标 unknown 一个字段。
 
         校验（全部通过才写库，否则拒绝且不留任何行）：
@@ -913,24 +914,33 @@ class Workbench:
                 value = "won"
             else:
                 return {"ok": False, "error": "中标结果须明确为中标或未中标"}
+        if reviewer_type not in (None, "", "agent", "test"):
+            # D-03（任务口径）：机器代理与人工复核写入必须可区分；
+            # 未知归属拒绝而非静默当人工（静默会误记操作者）
+            return {"ok": False,
+                    "error": "reviewer_type 只接受 agent/test（缺省为人工）"}
+        actor = {"agent": "agent", "test": "test"}.get(reviewer_type) \
+            or "本机用户"
         if field in ("contact_phone", "contact_email", "bank_account"):
             self._save_contact(event_id, lot_id, bidder_id, field, value,
                                evidence_id, source_role, original_candidate,
-                               action)
+                               action, actor=actor)
         elif field in ("person_manager", "person_tech", "authorize_rep",
                        "legal_rep", "id_number"):
             self._save_person(event_id, lot_id, bidder_id, field, value,
-                              evidence_id, person_id, original_candidate, action)
+                              evidence_id, person_id, original_candidate,
+                              action, actor=actor)
         else:
             with self.conn:
                 self._write_confirmation(
                     event_id, lot_id, bidder_id, field, value, evidence_id,
-                    source_role, original_candidate, action, person_id)
+                    source_role, original_candidate, action, person_id,
+                    actor=actor)
         return {"ok": True}
 
     def _write_confirmation(self, event_id, lot_id, bidder_id, field, value,
                             evidence_id, source_role, original_candidate,
-                            action, person_id=None):
+                            action, person_id=None, actor="本机用户"):
         """在调用方事务中追加历史并更新当前确认值。"""
         old = self.conn.execute(
             "SELECT value, evidence_id FROM confirmations"
@@ -956,7 +966,7 @@ class Workbench:
             (event_id, lot_id, bidder_id, field,
              old["value"] if old else None, encoded,
              old["evidence_id"] if old else None, evidence_id, action,
-             original_candidate, person_id, version, "本机用户", now))
+             original_candidate, person_id, version, actor, now))
         self.conn.execute(
             "INSERT INTO confirmations(event_id,lot_id,bidder_id,field,value,"
             " evidence_id,source_role,original_candidate,action,confirmed_at,"
@@ -971,7 +981,8 @@ class Workbench:
              source_role, original_candidate, action, now, person_id, version))
 
     def _save_contact(self, event_id, lot_id, bidder_id, field, value,
-                      evidence_id, source_role, original_candidate, action):
+                      evidence_id, source_role, original_candidate, action,
+                      actor="本机用户"):
         """按来源证据分别保存联系方式，避免后一个号码覆盖前一个。"""
         old = self.conn.execute(
             "SELECT value,evidence_id FROM contact_facts"
@@ -993,7 +1004,7 @@ class Workbench:
                     " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                     (event_id, lot_id, bidder_id, field,
                      json.dumps(active, ensure_ascii=False), '"unknown"', None,
-                     action, original_candidate, "本机用户", now))
+                     action, original_candidate, actor, now))
                 self.conn.execute(
                     "UPDATE contact_facts SET action='superseded'"
                     " WHERE event_id=? AND lot_id=? AND bidder_id=? AND field=?"
@@ -1033,7 +1044,7 @@ class Workbench:
                  old["value"] if old else None,
                  value if isinstance(value, str) else json.dumps(value, ensure_ascii=False),
                  old["evidence_id"] if old else None, evidence_id, action,
-                 original_candidate, "本机用户", now))
+                 original_candidate, actor, now))
             self.conn.execute(
                 "INSERT INTO contact_facts"
                 " (event_id,lot_id,bidder_id,field,value,evidence_id,source_role,"
@@ -1047,7 +1058,8 @@ class Workbench:
                  evidence_id, source_role, original_candidate, action, now))
 
     def _save_person(self, event_id, lot_id, bidder_id, field, value,
-                     evidence_id, person_id, original_candidate, action):
+                     evidence_id, person_id, original_candidate, action,
+                     actor="本机用户"):
         """保存多名人员及独立人工身份 ID；同名不会自动合并。"""
         now = _now()
         encoded = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
@@ -1072,7 +1084,7 @@ class Workbench:
                     " VALUES(?,?,?,?,?,?,?,?,?,?)",
                     (event_id, lot_id, bidder_id, field,
                      json.dumps(active, ensure_ascii=False), '"unknown"',
-                     action, original_candidate, "本机用户", now))
+                     action, original_candidate, actor, now))
                 self.conn.execute(
                     "UPDATE person_facts SET action='superseded'"
                     " WHERE event_id=? AND lot_id=? AND bidder_id=? AND field=?"
@@ -1111,7 +1123,7 @@ class Workbench:
                 (event_id, lot_id, bidder_id, field,
                  previous["value"] if previous else None, encoded,
                  previous["evidence_id"] if previous else None, evidence_id,
-                 action, original_candidate, pid, version, "本机用户", now))
+                 action, original_candidate, pid, version, actor, now))
             if previous:
                 self.conn.execute(
                     "UPDATE person_facts SET value=?,original_candidate=?,action=?,"
@@ -1131,7 +1143,8 @@ class Workbench:
                        raw_value, unit: str, currency: str,
                        tax_included, evidence_id: str | None,
                        action: str = "confirm",
-                       original_candidate: str | None = None) -> dict:
+                       original_candidate: str | None = None,
+                       reviewer_type: str | None = None) -> dict:
         """金额、来源单位、币种和税口径在同一 SQLite 事务中确认。"""
         from .money import normalize_confirmed_amount
 
@@ -1140,6 +1153,11 @@ class Workbench:
             return {"ok": False, "error": "event_id/lot_id/bidder_id 必填"}
         if action not in ("confirm", "correct", "unknown"):
             return {"ok": False, "error": "金额操作只接受 confirm/correct/unknown"}
+        if reviewer_type not in (None, "", "agent", "test"):
+            return {"ok": False,
+                    "error": "reviewer_type 只接受 agent/test（缺省为人工）"}
+        actor = {"agent": "agent", "test": "test"}.get(reviewer_type) \
+            or "本机用户"
         if action == "unknown":
             values = (("total_price", "unknown"), ("amount_unit", "unknown"),
                       ("currency", "unknown"), ("tax_included", "unknown"))
@@ -1170,7 +1188,7 @@ class Workbench:
             for field, value in values:
                 self._write_confirmation(
                     event_id, lot_id, bidder_id, field, value, evidence_id,
-                    "unknown", original_candidate, action)
+                    "unknown", original_candidate, action, actor=actor)
         return {"ok": True}
 
     @_locked

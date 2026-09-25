@@ -406,7 +406,8 @@ class Handler(BaseHTTPRequestHandler):
                 req.get("evidence_id"), req.get("action", "confirm"),
                 req.get("original_candidate"),
                 req.get("source_role", "unknown"),
-                req.get("person_id")))
+                req.get("person_id"),
+                reviewer_type=req.get("reviewer_type")))
             return
         if route == "/api/confirm_amount":
             req = self._read_json()
@@ -416,7 +417,8 @@ class Handler(BaseHTTPRequestHandler):
                 req.get("event_id"), req.get("lot_id"), req.get("bidder_id"),
                 req.get("raw_value"), req.get("unit"), req.get("currency"),
                 req.get("tax_included"), req.get("evidence_id"),
-                req.get("action", "confirm"), req.get("original_candidate")))
+                req.get("action", "confirm"), req.get("original_candidate"),
+                reviewer_type=req.get("reviewer_type")))
             return
         if route == "/api/bind_file":
             req = self._read_json()
