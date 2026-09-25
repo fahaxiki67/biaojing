@@ -37,6 +37,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, localcontext
 
 from .money import decimal_text
@@ -64,6 +65,7 @@ R001_EXCLUDED_CONTEXTS = {
 DEFAULT_THRESHOLDS = {
     "R004": {"min_comparable_bidders": 3, "min_rows_strong": 2},
     "R005": {"min_positive_bidders": 2, "range_ratio_max": 0.05, "cv_max": 0.03},
+    "R006": {"near_window_seconds": 120},
     "R007": {"known_lost_min": 3, "above_winning_min": 3},
     "R008": {"common_events_min": 3},
 }
@@ -886,10 +888,61 @@ def screen_r005(fb: FactBase, thresholds: dict) -> list[dict]:
 
 # ---------------------------------------------------------------- R006
 
+def _parse_creation(ts):
+    """解析文档内创建时间：返回 (datetime, 时区标注, 是否含时间部分) 或 None。
+
+    aware 一律规范化到 UTC 再比较；naive 保持原值，且不得与 aware 跨类比较。
+    仅接受 ISO 8601 风格（含常见空格分隔）；解析失败返回 None，绝不猜。
+    """
+    if not isinstance(ts, str):
+        return None
+    raw = ts.strip()
+    if not raw or raw.casefold() == "unknown":
+        return None
+    candidate = raw[:-1] + "+00:00" if raw.endswith(("Z", "z")) else raw
+    try:
+        dt = datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    has_time = len(raw) > 10 or (dt.hour or dt.minute or dt.second) != 0
+    if dt.tzinfo is not None:
+        tz_label = str(dt.tzinfo) or "UTC"
+        dt = dt.astimezone(timezone.utc)
+    else:
+        tz_label = "未标注时区(naive)"
+    return dt, tz_label, has_time
+
+
+_R006_CLUSTER_LIMITATIONS = [
+    "创建时间相近或同日不能单独证明共同编制；元数据时间可被复制或由统一平台生成",
+    "相同软件型号或版本不代表同一台物理设备，不得据其推断同一来源设备",
+    "时间为文档内元数据的创建时间，不是文件系统导入/复制时间；"
+    "导入/复制时间不得当作原件创建时间",
+]
+
+_R006_CLUSTER_ALTERNATIVES = [
+    "平台转码或另存为会复制/改写创建时间戳",
+    "同一模板或批量导出生成",
+    "统一扫描平台",
+    "同版办公软件",
+]
+
+
 def screen_r006(fb: FactBase, thresholds: dict) -> list[dict]:
     """文件属性相似：相同元数据值 + 来源/时间披露；通用软件或来源
-    unknown 降为待核信号，单独不能证明共同编制。"""
+    unknown 降为待核信号，单独不能证明共同编制。
+
+    时间聚集子分析（相近但不完全相同 / 同日）：
+      - 完全相等的 (producer, creation_date) 仍走原分组；
+      - 创建时间可解析时，aware 一律规范化到 UTC；naive 与 aware 不跨类比较；
+      - 相近窗口（默认 120 秒，可用 thresholds R006.near_window_seconds 覆盖）
+        内成"时间相近"簇；同日但超出窗口成"同日聚集"弱信号簇；
+      - 聚簇一律"待核信号"，保留 Creator/Producer、原始时间、时区、规范化
+        时间与窗口理由；同一批文件已被完全相等分组覆盖时不再重复上报。
+    """
+    window = int(thresholds.get("R006", {}).get("near_window_seconds", 120))
     by_sig = defaultdict(list)
+    timed = []  # (dt, tz_label, has_time, bid, file)
     for bid in fb.bids:
         if bid.role != "bidder":
             continue
@@ -903,7 +956,12 @@ def screen_r006(fb: FactBase, thresholds: dict) -> list[dict]:
             created = (f.metadata.get("creation_date") or "unknown").strip()
             sig = (producer.lower(), created)
             by_sig[sig].append((bid, f))
+            parsed = _parse_creation(created)
+            if parsed is not None:
+                dt, tz_label, has_time = parsed
+                timed.append((dt, tz_label, has_time, bid, f))
     findings = []
+    exact_sets: list[frozenset] = []
     for (producer, created), occ in sorted(by_sig.items()):
         bidders = sorted({b.bidder_id for b, _ in occ})
         if len(bidders) < 2:
@@ -922,6 +980,7 @@ def screen_r006(fb: FactBase, thresholds: dict) -> list[dict]:
             reasons.append("创建时间缺失，不构成时间一致")
         # created unknown 本身即降级：不得声称创建时间一致
         degraded = generic or unknown_src or created_unknown
+        exact_sets.append(frozenset((b.bidder_id, f.file_ref) for b, f in occ))
         findings.append(make_finding(
             "R006",
             scope={"producer": producer, "creation_date": created,
@@ -947,6 +1006,140 @@ def screen_r006(fb: FactBase, thresholds: dict) -> list[dict]:
             limitations=["相同通用软件不能单独证明共同编制；元数据可被复制或由统一平台生成"],
             alternatives=["统一扫描平台、同版办公软件、模板同源"],
             signal="待核信号" if degraded else "线索",
+        ))
+
+    # ---- 时间聚集子分析（相近但不完全相同 / 同日）----
+    if len(timed) < 2:
+        return findings
+    parent = list(range(len(timed)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i, j):
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[rj] = ri
+
+    for i in range(len(timed)):
+        dt_i, _, has_i, _, _ = timed[i]
+        for j in range(i + 1, len(timed)):
+            dt_j, _, has_j, _, _ = timed[j]
+            # naive 与 aware 不得跨类比较；无时间部分不得判秒级相近
+            if (dt_i.tzinfo is None) != (dt_j.tzinfo is None):
+                continue
+            if not (has_i and has_j):
+                continue
+            if abs((dt_i - dt_j).total_seconds()) <= window:
+                union(i, j)
+    groups = defaultdict(list)
+    for i in range(len(timed)):
+        groups[find(i)].append(i)
+    tight_sets: list[frozenset] = []
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        entries = [timed[i] for i in members]
+        bidders = sorted({b.bidder_id for _, _, _, b, _ in entries})
+        if len(bidders) < 2:
+            continue
+        key_set = frozenset((b.bidder_id, f.file_ref) for _, _, _, b, f in entries)
+        if any(key_set <= s for s in exact_sets):
+            continue  # 已被完全相等分组覆盖，不重复上报
+        tight_sets.append(key_set)
+        dts = [dt for dt, _, _, _, _ in entries]
+        span = int((max(dts) - min(dts)).total_seconds())
+        findings.append(make_finding(
+            "R006",
+            scope={"cluster_mode": "tight_window", "normalized_date":
+                   min(dts).date().isoformat(), "bidder_ids": bidders},
+            inputs={"files": [
+                {"event_id": b.event_id, "lot_id": b.lot_id,
+                 "bidder_id": b.bidder_id, "file_ref": f.file_ref,
+                 "sha256": f.sha256[:16] + "…",
+                 "creator": (f.metadata.get("creator") or "unknown"),
+                 "producer": ((f.metadata.get("producer") or "unknown").strip()),
+                 "creation_date": ((f.metadata.get("creation_date")
+                                    or "unknown").strip()),
+                 "timezone": tz_label, "normalized_time": dt.isoformat(),
+                 "has_time": has_time, "source_type": f.source_type,
+                 "evidence": f.evidence}
+                for dt, tz_label, has_time, b, f in entries]},
+            params={"cluster_mode": "tight_window",
+                    "near_window_seconds": window,
+                    "window_rationale":
+                        f"组内创建时间最大相差 {span} 秒，处于 {window} 秒"
+                        "相近窗口内（相近但不完全相同）",
+                    "time_source": "document_internal_metadata"
+                                   "（文档内元数据创建时间，非导入/复制时间）",
+                    "generic_producer_list": list(GENERIC_PRODUCERS),
+                    "degraded": True,
+                    "degrade_reasons": ["创建时间相近但不完全相同，弱于完全一致"]},
+            trigger_reason=(
+                f"{len(bidders)} 个投标主体的文件创建时间相近但不完全相同"
+                f"（组内最大相差 {span} 秒，≤{window} 秒窗口），降为待核信号"),
+            evidence_ids=sorted({f.evidence for _, _, _, _, f in entries}),
+            limitations=list(_R006_CLUSTER_LIMITATIONS),
+            alternatives=list(_R006_CLUSTER_ALTERNATIVES),
+            signal="待核信号",
+        ))
+    # 同日聚集：同规范化日期且同类（aware/naive），不受相近窗口约束
+    day_groups = defaultdict(list)
+    for dt, tz_label, has_time, b, f in timed:
+        day_groups[(dt.date(), dt.tzinfo is None)].append(
+            (dt, tz_label, has_time, b, f))
+    for (_, _), entries in sorted(
+            day_groups.items(), key=lambda kv: str(kv[0][0])):
+        bidders = sorted({b.bidder_id for _, _, _, b, _ in entries})
+        if len(bidders) < 2:
+            continue
+        key_set = frozenset((b.bidder_id, f.file_ref) for _, _, _, b, f in entries)
+        if any(key_set <= s for s in exact_sets) \
+                or any(key_set <= s for s in tight_sets):
+            continue  # 完全相等或更近的簇已覆盖
+        dts = [dt for dt, _, _, _, _ in entries]
+        date_label = min(dts).date().isoformat()
+        if all(has for _, _, has, _, _ in entries):
+            span = int((max(dts) - min(dts)).total_seconds())
+            span_note = f"，组内时间跨度 {span} 秒"
+        else:
+            span_note = "（部分文件仅有日期、无时间部分）"
+        findings.append(make_finding(
+            "R006",
+            scope={"cluster_mode": "same_day",
+                   "normalized_date": date_label, "bidder_ids": bidders},
+            inputs={"files": [
+                {"event_id": b.event_id, "lot_id": b.lot_id,
+                 "bidder_id": b.bidder_id, "file_ref": f.file_ref,
+                 "sha256": f.sha256[:16] + "…",
+                 "creator": (f.metadata.get("creator") or "unknown"),
+                 "producer": ((f.metadata.get("producer") or "unknown").strip()),
+                 "creation_date": ((f.metadata.get("creation_date")
+                                    or "unknown").strip()),
+                 "timezone": tz_label, "normalized_time": dt.isoformat(),
+                 "has_time": has_time, "source_type": f.source_type,
+                 "evidence": f.evidence}
+                for dt, tz_label, has_time, b, f in entries]},
+            params={"cluster_mode": "same_day",
+                    "near_window_seconds": window,
+                    "window_rationale":
+                        f"规范化日期同为 {date_label}，同日聚集（弱于相近窗口）"
+                        + span_note,
+                    "time_source": "document_internal_metadata"
+                                   "（文档内元数据创建时间，非导入/复制时间）",
+                    "generic_producer_list": list(GENERIC_PRODUCERS),
+                    "degraded": True,
+                    "degrade_reasons": ["同日聚集为弱信号，时间未必相近"]},
+            trigger_reason=(
+                f"{len(bidders)} 个投标主体的文件创建时间同日聚集"
+                f"（规范化日期 {date_label}{span_note}），降为待核信号"),
+            evidence_ids=sorted({f.evidence for _, _, _, _, f in entries}),
+            limitations=list(_R006_CLUSTER_LIMITATIONS),
+            alternatives=list(_R006_CLUSTER_ALTERNATIVES),
+            signal="待核信号",
         ))
     return findings
 
@@ -1162,7 +1355,9 @@ SCREENERS = [screen_r001, screen_r002, screen_r003, screen_r004,
 def screen_all(fb: FactBase, thresholds: dict | None = None) -> dict:
     """执行 R001—R008，并说明逐规则的检查条件与覆盖状态。"""
     fb.validate_prices()
-    th = dict(DEFAULT_THRESHOLDS)
+    # 每个规则的内层阈值 dict 必须复制：调用方经 setdefault().update() 覆盖时
+    # 不得就地污染 DEFAULT_THRESHOLDS（否则测试与调用顺序互相影响）
+    th = {k: dict(v) for k, v in DEFAULT_THRESHOLDS.items()}
     if thresholds:
         for k, v in thresholds.items():
             th.setdefault(k, {}).update(v)
