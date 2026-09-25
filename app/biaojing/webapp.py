@@ -186,6 +186,11 @@ class Handler(BaseHTTPRequestHandler):
             self._reject(400, "Content-Length 非法")
             return None
         if length <= 0:
+            # 空上传同样进入覆盖率（带原因的拒收记录），分母不漏该
+            # 提交；安全拒绝语义不变：不为空文件产出 artifact/哈希/证据
+            if record_reject_to is not None:
+                record_reject_to(reject_name,
+                                 f"请求体为空（{length} 字节），拒收")
             self._reject(400, "缺少请求体")
             return None
         if length > MAX_BODY:
