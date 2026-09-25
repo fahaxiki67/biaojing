@@ -7,7 +7,7 @@
 
 PRODUCT_NAME = "标镜"
 AUTHOR = "刘奇"
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 
 # extract_status 取值（唯一全集，报告与下游按此口径）
 STATUS_SUCCESS = "success"

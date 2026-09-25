@@ -719,7 +719,8 @@ class HttpSmokeTests(unittest.TestCase):
         self.assertEqual(code, 200)
         about = json.loads(body)
         self.assertEqual(about["author"], "刘奇")
-        self.assertEqual(about["version"], "0.2.1")
+        from biaojing import VERSION
+        self.assertEqual(about["version"], VERSION)
 
     def test_update_check_is_explicitly_unconfigured_without_repository(self):
         from unittest.mock import patch

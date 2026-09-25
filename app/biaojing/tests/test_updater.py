@@ -117,7 +117,8 @@ class UpdaterTests(unittest.TestCase):
                 Response(archive,
                          "https://release-assets.githubusercontent.com/biaojing.zip"),
             ])
-            with patch.object(updater, "_project_root", return_value=root), \
+            with patch.object(updater, "VERSION", "0.2.1"), \
+                    patch.object(updater, "_project_root", return_value=root), \
                     patch.object(updater, "urlopen", side_effect=lambda *a, **k: next(replies)):
                 result = updater.check_and_stage_update("test/biaojing")
             self.assertEqual(result["status"], "staged")
